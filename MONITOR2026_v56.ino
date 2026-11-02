@@ -8,6 +8,14 @@
  *   Home Network   - sensor and monitor on the same home WiFi (monitor polls the sensor)
  *   Auto           - listen on every wireless link this hardware has
  *
+ * Wired sensor types (Settings > Sensor Connection > Wired):
+ *   Standard (Trig/Echo) - HC-SR04 / JSN on TRIG 25, ECHO 34 (cable up to ~50 m)
+ *   UART                 - DYP-A01/A21 on TX 25 -> sensor RX, RX 34 <- sensor TX
+ *                          (auto-stream or controlled, baud auto-detected)
+ *   RS485 (UART bridge)  - DYP-A06 controlled via TTL-RS485 bridge, 9600, trigger 0x55
+ *   RS485 Modbus         - Modbus-RTU sensor, function 0x03, real-time register 0x0101
+ *   RS485 pins: RX 5, TX 17, DE/RE 25 (no Long Range module on these boards)
+ *
  * Every link delivers the same micro-payload:
  *   {"i":"US3847","s":51,"c":102,"d":143}   data      (d = distance in cm)
  *   {"i":"US3847","s":51,"c":103,"h":1}     heartbeat (sensor alive, reading failed)
@@ -36,7 +44,7 @@
 #include <math.h>
 #include <mvsota_esp32.h>
 
-#define FIRMWARE_VERSION "56.0.0"
+#define FIRMWARE_VERSION "56.1.0"
 #define FIRMWARE_CODE "SF-MN-2026-9867"
 
 // Debug mode: 1 prints internal link names (LoRa / ESP-NOW / mDNS) on Serial
@@ -77,7 +85,22 @@
 #define MAD_MULTIPLIER 2.5
 #define SENSOR_READ_INTERVAL_MS 2000
 #define NO_ECHO_ABORT_SAMPLES 3        // Stop a read cycle early if the first pulses all time out
-#define WIRED_OFFLINE_CYCLES 3         // Cycles with no echo at all before the wired sensor shows OFFLINE
+#define WIRED_OFFLINE_CYCLES 3         // Silent cycles (no echo/bytes/reply) before the display says CHECK SENSOR
+
+// Serial wired sensors (UART / RS485)
+#define SENSOR_UART_TX_PIN 25          // -> sensor RX (same terminal as TRIG)
+#define SENSOR_UART_RX_PIN 34          // <- sensor TX (same terminal as ECHO)
+#define RS485_RX_PIN 5                 // <- RS485 module RO
+#define RS485_TX_PIN 17                // -> RS485 module DI
+#define RS485_DIR_PIN 25               // RS485 module DE+RE (shorted), HIGH = transmit
+#define RS485_BAUD 9600
+#define RS485_BRIDGE_TRIGGER 0x55      // Any byte triggers the DYP-A06; 0x55 is bench-confirmed
+#define MODBUS_REG_REALTIME 0x0101     // Always real-time - processed register gave stale readings
+#define SERIAL_SAMPLES 7               // Readings per cycle for serial sensors (taken in the background)
+#define SERIAL_MIN_VALID 4             // Valid readings needed for a result
+#define UART_DETECT_RETRY_MS 300000UL  // Retry UART auto-detect every 5 min while nothing is found
+#define ZONE_UPPER_MARGIN_CM 7         // Within blind zone + 7 cm = UPPER (tank nearly full)
+#define ZONE_LOWER_MARGIN_CM 5         // Within 5 cm of the tank floor (or beyond) = LOWER
 
 // Link supervision
 #define WIRELESS_SILENT_MS 60000UL     // No packet at all for this long -> display shows OFFLINE
@@ -96,6 +119,38 @@ enum LinkType : uint8_t {
   LINK_AUTO = 4
 };
 #define LINK_TYPE_COUNT 5
+
+// Wired sensor types (stored in EEPROM)
+enum WiredSensorType : uint8_t {
+  WS_TRIG_ECHO = 0,     // HC-SR04 / JSN pulse
+  WS_UART = 1,          // DYP-A01 controlled / DYP-A21 auto-stream, direct UART
+  WS_RS485_BRIDGE = 2,  // DYP-A06 controlled over a TTL-RS485 bridge
+  WS_MODBUS = 3         // Native RS485 Modbus-RTU sensor
+};
+#define WIRED_TYPE_COUNT 4
+
+// UART sensor mode: setting (0 = auto-detect) and the detected/forced mode
+enum UartMode : uint8_t {
+  UART_DETECT = 0,
+  UART_STREAM_9600 = 1,
+  UART_STREAM_115200 = 2,
+  UART_CONTROLLED_9600 = 3
+};
+
+// Result of one sensor sample
+enum SampleResult : uint8_t {
+  SAMPLE_SILENT = 0,    // No echo / no bytes / no reply
+  SAMPLE_ANSWERED = 1,  // Sensor answered but no usable distance (out of range, bad frame, exception)
+  SAMPLE_VALID = 2
+};
+
+// Last known zone, used when a reading fails but the sensor still answers
+enum TankZone : uint8_t {
+  ZONE_NONE = 0,
+  ZONE_UPPER = 1,   // Near the sensor - tank nearly full
+  ZONE_MIDDLE = 2,
+  ZONE_LOWER = 3    // At/beyond the tank floor - tank nearly empty
+};
 
 // Which link actually delivered a message
 enum LinkVia : uint8_t {
@@ -162,6 +217,11 @@ MvsOTA mvsota;
 #define EEPROM_LINK_TYPE 301         // Connection type (1 byte)
 #define EEPROM_LOG_THRESHOLD 302     // History: log on % change (5 or 10)
 #define EEPROM_LOG_INTERVAL 303      // History: periodic log interval in minutes (30 or 60)
+#define EEPROM_WIRED_TYPE 304        // Wired sensor type (1 byte)
+#define EEPROM_MODBUS_ADDR 305       // Modbus slave address 1-247 (1 byte)
+#define EEPROM_UART_SETTING 306      // UART mode setting: 0 auto-detect, 1-3 forced (1 byte)
+#define EEPROM_UART_DETECTED 307     // UART mode found by auto-detect (1 byte)
+#define EEPROM_ZONE 308              // Last zone (1 byte)
 #define MAGIC_NUMBER 0xAB
 #define LINK_MAGIC 0xA7
 
@@ -287,6 +347,28 @@ SensorData tankData;
 
 // Connection settings
 LinkType linkType = LINK_AUTO;
+WiredSensorType wiredType = WS_TRIG_ECHO;
+uint8_t modbusAddress = 1;
+UartMode uartSetting = UART_DETECT;    // What the installer chose
+UartMode uartActive = UART_DETECT;     // What is running (UART_DETECT = nothing found yet)
+unsigned long lastUartDetect = 0;
+HardwareSerial sensorSerial(2);        // UART2 for UART / RS485 sensors
+
+// Serial sensor sampling (one sample per loop pass)
+float serialSamples[SERIAL_SAMPLES];
+uint8_t serialSampleCount = 0;
+uint8_t serialValidCount = 0;
+bool serialAnswered = false;
+unsigned long lastSerialSample = 0;
+unsigned long serialCycleStart = 0;
+
+// Zone memory
+TankZone lastZone = ZONE_NONE;
+bool zoneEstimate = false;             // Current value is a zone estimate (Full / Empty)
+
+// Diagnostics: last raw frame from a serial sensor
+uint8_t lastRawFrame[8];
+uint8_t lastRawLen = 0;
 bool loraPresent = false;        // Long Range module detected at boot
 bool loraActive = false;
 bool nearbyActive = false;
@@ -842,6 +924,19 @@ void loadLinkSettings() {
   }
   if (logThresholdPercent != 5 && logThresholdPercent != 10) logThresholdPercent = 10;
   if (logIntervalMinutes != 30 && logIntervalMinutes != 60) logIntervalMinutes = 60;
+
+  // Wired sensor settings (0xFF = never written -> defaults)
+  uint8_t w = EEPROM.read(EEPROM_WIRED_TYPE);
+  wiredType = (w < WIRED_TYPE_COUNT) ? (WiredSensorType)w : WS_TRIG_ECHO;
+  modbusAddress = EEPROM.read(EEPROM_MODBUS_ADDR);
+  if (modbusAddress < 1 || modbusAddress > 247) modbusAddress = 1;
+  uint8_t u = EEPROM.read(EEPROM_UART_SETTING);
+  uartSetting = (u <= UART_CONTROLLED_9600) ? (UartMode)u : UART_DETECT;
+  uint8_t d = EEPROM.read(EEPROM_UART_DETECTED);
+  uartActive = (uartSetting != UART_DETECT) ? uartSetting
+             : ((d >= UART_STREAM_9600 && d <= UART_CONTROLLED_9600) ? (UartMode)d : UART_DETECT);
+  uint8_t z = EEPROM.read(EEPROM_ZONE);
+  lastZone = (z <= ZONE_LOWER) ? (TankZone)z : ZONE_NONE;
 }
 
 void saveLinkSettings() {
@@ -849,7 +944,56 @@ void saveLinkSettings() {
   EEPROM.write(EEPROM_LINK_TYPE, (uint8_t)linkType);
   EEPROM.write(EEPROM_LOG_THRESHOLD, logThresholdPercent);
   EEPROM.write(EEPROM_LOG_INTERVAL, logIntervalMinutes);
+  EEPROM.write(EEPROM_WIRED_TYPE, (uint8_t)wiredType);
+  EEPROM.write(EEPROM_MODBUS_ADDR, modbusAddress);
+  EEPROM.write(EEPROM_UART_SETTING, (uint8_t)uartSetting);
   EEPROM.commit();
+}
+
+// Remember the UART mode auto-detect found (so later boots start instantly)
+void saveUartDetected(UartMode m) {
+  EEPROM.write(EEPROM_UART_DETECTED, (uint8_t)m);
+  EEPROM.commit();
+}
+
+const char* wiredTypeName(WiredSensorType t) {
+  switch (t) {
+    case WS_UART: return "UART";
+    case WS_RS485_BRIDGE: return "RS485 (UART bridge)";
+    case WS_MODBUS: return "RS485 Modbus";
+    default: return "Standard (Trig/Echo)";
+  }
+}
+
+const char* uartModeName(UartMode m) {
+  switch (m) {
+    case UART_STREAM_9600: return "Auto-stream 9600";
+    case UART_STREAM_115200: return "Auto-stream 115200";
+    case UART_CONTROLLED_9600: return "Controlled 9600";
+    default: return "Not detected";
+  }
+}
+
+// Sensor physics for the % calculation and validity checks.
+// Wireless transmitters use HC-SR04 limits (they already clamp/calibrate).
+float sensorBlindZone() {
+  if (linkType != LINK_WIRED) return SENSOR_BLIND_ZONE_CM;
+  switch (wiredType) {
+    case WS_UART:
+    case WS_MODBUS: return 28.0;        // DYP-A01 / Modbus horn sensor
+    case WS_RS485_BRIDGE: return 30.0;  // DYP-A06
+    default: return SENSOR_BLIND_ZONE_CM;
+  }
+}
+
+float sensorMaxRange() {
+  if (linkType != LINK_WIRED) return SENSOR_MAX_RANGE_CM;
+  switch (wiredType) {
+    case WS_UART:
+    case WS_MODBUS: return 750.0;
+    case WS_RS485_BRIDGE: return 200.0;
+    default: return SENSOR_MAX_RANGE_CM;
+  }
 }
 
 // Save just the paired node ID (bytes 0-7 of the tank block)
@@ -1150,6 +1294,22 @@ void configureConnection() {
   Serial.println("7. Back");
 
   int choice = getIntInput("Select option (0-7): ", 0, 7);
+  if (choice == 0) {
+    Serial.println("\nWired sensor type:");
+    Serial.println("0. Standard (Trig/Echo)");
+    Serial.println("1. UART");
+    Serial.println("2. RS485 (UART bridge)");
+    Serial.println("3. RS485 Modbus");
+    wiredType = (WiredSensorType)getIntInput("Select type (0-3): ", 0, 3);
+    if (wiredType == WS_MODBUS) {
+      modbusAddress = getIntInput("Modbus address (1-247, usually 1): ", 1, 247);
+    }
+    if (wiredType == WS_UART) {
+      Serial.println("UART mode: 0 = detect automatically, 1 = auto-stream 9600, 2 = auto-stream 115200, 3 = controlled 9600");
+      uartSetting = (UartMode)getIntInput("Select mode (0-3): ", 0, 3);
+      if (uartSetting == UART_DETECT) saveUartDetected(UART_DETECT);
+    }
+  }
   if (choice <= 4) {
     linkType = (LinkType)choice;
     saveLinkSettings();
@@ -1230,7 +1390,7 @@ void configureTankSensor() {
   }
 
   // Tank Height
-  newConfig.height = getIntInput("Enter Tank Height (cm, 50-450): ", 50, 450);
+  newConfig.height = getIntInput("Enter Tank Height (cm, 50-750): ", 50, 750);
 
   // Tank Volume
   newConfig.volume = getIntInput("Enter Tank Volume in Litres (0 to skip, 1-99999): ", 0, 99999);
@@ -1487,56 +1647,9 @@ void sortReadings(float arr[], int n) {
   }
 }
 
-// Fire one trig pulse and return the echo duration in microseconds (0 = no echo)
-long readEchoDuration() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(5);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(15);
-  digitalWrite(TRIG_PIN, LOW);
-
-  return pulseIn(ECHO_PIN, HIGH, 60000);  // 60ms timeout
-}
-
-// Takes multiple samples and returns a MAD-filtered median distance in cm.
-// Returns -1.0 if not enough valid samples were captured.
-// echoCount reports how many pulses got ANY echo (even out of range), so a sensor
-// that answers but cannot measure is told apart from one that is disconnected.
-float readDistanceCM(int* echoCount) {
-  float readings[SAMPLE_COUNT];
-  int count = 0;
-  int echoes = 0;
-
-  for (int i = 0; i < SAMPLE_COUNT; i++) {
-    long duration = readEchoDuration();
-    float distance = duration * 0.0343 / 2;  // Convert to cm
-
-    if (duration > 0) {
-      echoes++;
-    }
-    if (duration > 0 && distance > SENSOR_BLIND_ZONE_CM && distance <= SENSOR_MAX_RANGE_CM) {
-      readings[count++] = distance;
-    }
-
-    // Nothing answering at all - stop early instead of blocking the loop for ~1.6s
-    if (i + 1 == NO_ECHO_ABORT_SAMPLES && echoes == 0) {
-      break;
-    }
-
-    delay(READING_DELAY);
-  }
-
-  if (echoCount) {
-    *echoCount = echoes;
-  }
-
-  if (count < MIN_VALID_SAMPLES) {
-    #if DEBUG_MODE
-    Serial.printf("Ultrasonic read failed: %d valid of %d echoes\n", count, echoes);
-    #endif
-    return -1.0;
-  }
-
+// Median of the readings after rejecting outliers with the MAD filter.
+// Sorts the array in place.
+float madFilteredMedian(float* readings, int count) {
   sortReadings(readings, count);
 
   float median;
@@ -1571,7 +1684,7 @@ float readDistanceCM(int* echoCount) {
     }
   }
 
-  if (cleanCount >= (MIN_VALID_SAMPLES / 2)) {
+  if (cleanCount >= max(2, count / 2)) {
     sortReadings(cleanReadings, cleanCount);
     if (cleanCount % 2 == 1) {
       median = cleanReadings[cleanCount / 2];
@@ -1583,20 +1696,297 @@ float readDistanceCM(int* echoCount) {
   return median;
 }
 
-void processWaterLevelData(float ultrasonicReading) {
+// ---------- Standard (Trig/Echo) ----------
+
+// Fire one trig pulse and return the echo duration in microseconds (0 = no echo)
+long readEchoDuration() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(5);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(15);
+  digitalWrite(TRIG_PIN, LOW);
+
+  return pulseIn(ECHO_PIN, HIGH, 60000);  // 60ms timeout
+}
+
+// Takes multiple samples and returns a MAD-filtered median distance in cm.
+// Returns -1.0 if not enough valid samples were captured.
+// echoCount reports how many pulses got ANY echo (even out of range), so a sensor
+// that answers but cannot measure is told apart from one that is disconnected.
+float readDistanceCM(int* echoCount) {
+  float readings[SAMPLE_COUNT];
+  int count = 0;
+  int echoes = 0;
+
+  for (int i = 0; i < SAMPLE_COUNT; i++) {
+    long duration = readEchoDuration();
+    float distance = duration * 0.0343 / 2;  // Convert to cm
+
+    if (duration > 0) {
+      echoes++;
+    }
+    if (duration > 0 && distance > sensorBlindZone() && distance <= sensorMaxRange()) {
+      readings[count++] = distance;
+    }
+
+    // Nothing answering at all - stop early instead of blocking the loop for ~1.6s
+    if (i + 1 == NO_ECHO_ABORT_SAMPLES && echoes == 0) {
+      break;
+    }
+
+    delay(READING_DELAY);
+  }
+
+  if (echoCount) {
+    *echoCount = echoes;
+  }
+
+  if (count < MIN_VALID_SAMPLES) {
+    #if DEBUG_MODE
+    Serial.printf("Ultrasonic read failed: %d valid of %d echoes\n", count, echoes);
+    #endif
+    return -1.0;
+  }
+
+  return madFilteredMedian(readings, count);
+}
+
+// ---------- Serial sensors (UART / RS485) ----------
+
+void rememberRawFrame(const uint8_t* buf, uint8_t len) {
+  lastRawLen = min((int)len, (int)sizeof(lastRawFrame));
+  memcpy(lastRawFrame, buf, lastRawLen);
+}
+
+// Check a distance in mm against the selected sensor's range
+SampleResult classifyDistanceMm(uint16_t mm, float* cm) {
+  if (mm == 0xFFFE || mm == 0xFFFF || mm == 0) return SAMPLE_ANSWERED;  // DYP interference / no target
+  float d = mm / 10.0f;
+  if (d < sensorBlindZone() || d > sensorMaxRange()) return SAMPLE_ANSWERED;
+  *cm = d;
+  return SAMPLE_VALID;
+}
+
+// Read one DYP frame (0xFF HH LL SUM) within timeoutMs.
+// Any byte at all counts as "the sensor answered".
+SampleResult readDypFrame(uint32_t timeoutMs, float* cm) {
+  bool gotBytes = false;
+  uint8_t frame[4];
+  uint8_t n = 0;
+  unsigned long start = millis();
+
+  while (millis() - start < timeoutMs) {
+    if (!sensorSerial.available()) {
+      delay(1);
+      continue;
+    }
+    uint8_t b = sensorSerial.read();
+    gotBytes = true;
+    if (n == 0 && b != 0xFF) continue;  // Resync on the start byte
+    frame[n++] = b;
+    if (n == 4) {
+      rememberRawFrame(frame, 4);
+      if (((frame[0] + frame[1] + frame[2]) & 0xFF) == frame[3]) {
+        return classifyDistanceMm((frame[1] << 8) | frame[2], cm);
+      }
+      n = 0;  // Bad checksum - keep looking within the window
+    }
+  }
+  return gotBytes ? SAMPLE_ANSWERED : SAMPLE_SILENT;
+}
+
+void rs485SetTransmit(bool transmit) {
+  digitalWrite(RS485_DIR_PIN, transmit ? HIGH : LOW);
+}
+
+void rs485Send(const uint8_t* buf, size_t len) {
+  while (sensorSerial.available()) sensorSerial.read();  // Drop stale bytes
+  rs485SetTransmit(true);
+  delayMicroseconds(100);
+  sensorSerial.write(buf, len);
+  sensorSerial.flush();
+  delayMicroseconds(100);
+  rs485SetTransmit(false);
+}
+
+// CRC-16/MODBUS: poly 0xA001, init 0xFFFF (01 03 01 00 00 01 -> 85 F6)
+uint16_t modbusCRC16(const uint8_t* buf, uint8_t len) {
+  uint16_t crc = 0xFFFF;
+  for (uint8_t i = 0; i < len; i++) {
+    crc ^= buf[i];
+    for (uint8_t b = 0; b < 8; b++) {
+      if (crc & 0x0001) {
+        crc >>= 1;
+        crc ^= 0xA001;
+      } else {
+        crc >>= 1;
+      }
+    }
+  }
+  return crc;
+}
+
+// Modbus-RTU: read holding register 0x0101 (real-time distance, mm)
+SampleResult readModbusSample(float* cm) {
+  uint8_t req[8] = {modbusAddress, 0x03, (uint8_t)(MODBUS_REG_REALTIME >> 8), (uint8_t)(MODBUS_REG_REALTIME & 0xFF), 0x00, 0x01, 0, 0};
+  uint16_t crc = modbusCRC16(req, 6);
+  req[6] = crc & 0xFF;
+  req[7] = crc >> 8;
+  rs485Send(req, 8);
+
+  // Normal reply: addr 03 02 HH LL CRClo CRChi (7 bytes); exception: addr 83 code CRC (5 bytes)
+  uint8_t resp[7];
+  uint8_t n = 0;
+  unsigned long start = millis();
+  unsigned long lastByte = start;
+  while (n < 7 && millis() - start < 300) {
+    if (sensorSerial.available()) {
+      resp[n++] = sensorSerial.read();
+      lastByte = millis();
+      if (n == 5 && resp[1] == 0x83) break;  // Exception reply is complete
+    } else if (n > 0 && millis() - lastByte > 30) {
+      break;  // Stalled partial frame
+    } else {
+      delay(1);
+    }
+  }
+  if (n > 0) rememberRawFrame(resp, n);
+  if (n == 0) return SAMPLE_SILENT;
+  if (n < 7 || resp[0] != modbusAddress || resp[1] != 0x03 || resp[2] != 0x02) return SAMPLE_ANSWERED;
+  if (modbusCRC16(resp, 5) != (uint16_t)(resp[5] | (resp[6] << 8))) return SAMPLE_ANSWERED;
+  return classifyDistanceMm((resp[3] << 8) | resp[4], cm);
+}
+
+// DYP-A06 behind a TTL-RS485 bridge: any byte triggers one measurement
+SampleResult readBridgeSample(float* cm) {
+  uint8_t trig = RS485_BRIDGE_TRIGGER;
+  rs485Send(&trig, 1);
+  return readDypFrame(200, cm);  // Sensor replies within ~140 ms
+}
+
+// Direct UART DYP sensor in its detected/forced mode
+SampleResult readUartSample(float* cm) {
+  switch (uartActive) {
+    case UART_CONTROLLED_9600:
+      while (sensorSerial.available()) sensorSerial.read();
+      sensorSerial.write((uint8_t)RS485_BRIDGE_TRIGGER);  // Start bit = falling edge on the sensor's RX
+      sensorSerial.flush();
+      return readDypFrame(200, cm);
+    case UART_STREAM_9600:
+    case UART_STREAM_115200:
+      while (sensorSerial.available() > 8) sensorSerial.read();  // Keep only the newest frames
+      return readDypFrame(150, cm);  // Sensor streams every ~100 ms
+    default:
+      return SAMPLE_SILENT;  // Nothing detected yet
+  }
+}
+
+void beginSensorUart(uint32_t baud) {
+  sensorSerial.end();
+  sensorSerial.begin(baud, SERIAL_8N1, SENSOR_UART_RX_PIN, SENSOR_UART_TX_PIN);
+  delay(20);
+  while (sensorSerial.available()) sensorSerial.read();
+}
+
+// Find the UART sensor's mode and baud: auto-stream @115200, auto-stream @9600, controlled @9600.
+// Blocks up to ~3s. The result is saved so later boots skip this.
+bool detectUartSensor() {
+  lastUartDetect = millis();
+  float cm;
+  const UartMode order[] = {UART_STREAM_115200, UART_STREAM_9600, UART_CONTROLLED_9600};
+  for (UartMode m : order) {
+    beginSensorUart(m == UART_STREAM_115200 ? 115200 : 9600);
+    uartActive = m;
+    lastRawLen = 0;
+    SampleResult r = (m == UART_CONTROLLED_9600) ? readUartSample(&cm) : readDypFrame(1200, &cm);
+    // A checksummed frame proves mode + baud even if the distance is out of range
+    bool gotFrame = (r == SAMPLE_VALID) || (r == SAMPLE_ANSWERED && lastRawLen == 4 && lastRawFrame[0] == 0xFF &&
+                    ((lastRawFrame[0] + lastRawFrame[1] + lastRawFrame[2]) & 0xFF) == lastRawFrame[3]);
+    if (gotFrame) {
+      Serial.print("UART sensor detected: ");
+      Serial.println(uartModeName(m));
+      saveUartDetected(m);
+      return true;
+    }
+  }
+  uartActive = UART_DETECT;
+  Serial.println("UART sensor not detected - check wiring (TX 25 -> sensor RX, RX 34 <- sensor TX)");
+  return false;
+}
+
+// Bring up the selected wired sensor's interface
+void startWiredSensor() {
+  switch (wiredType) {
+    case WS_UART:
+      if (uartActive == UART_DETECT) {
+        detectUartSensor();
+      } else {
+        beginSensorUart(uartActive == UART_STREAM_115200 ? 115200 : 9600);
+      }
+      break;
+    case WS_RS485_BRIDGE:
+    case WS_MODBUS:
+      pinMode(RS485_DIR_PIN, OUTPUT);
+      rs485SetTransmit(false);
+      sensorSerial.end();
+      sensorSerial.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+      break;
+    default:
+      pinMode(TRIG_PIN, OUTPUT);
+      pinMode(ECHO_PIN, INPUT);
+      digitalWrite(TRIG_PIN, LOW);
+      break;
+  }
+  Serial.print("Wired sensor: ");
+  Serial.print(wiredTypeName(wiredType));
+  if (wiredType == WS_MODBUS) Serial.printf(" (address %u)", modbusAddress);
+  if (wiredType == WS_UART) Serial.printf(" (%s)", uartModeName(uartActive));
+  Serial.println();
+}
+
+// One reading from the selected serial sensor
+SampleResult readSerialSample(float* cm) {
+  switch (wiredType) {
+    case WS_UART: return readUartSample(cm);
+    case WS_RS485_BRIDGE: return readBridgeSample(cm);
+    case WS_MODBUS: return readModbusSample(cm);
+    default: return SAMPLE_SILENT;
+  }
+}
+
+// ---------- Zone memory ----------
+
+TankZone zoneForDistance(float cm) {
+  if (cm <= sensorBlindZone() + ZONE_UPPER_MARGIN_CM) return ZONE_UPPER;
+  if (cm >= tankConfig.height - ZONE_LOWER_MARGIN_CM) return ZONE_LOWER;
+  return ZONE_MIDDLE;
+}
+
+// Saved to EEPROM only when the zone changes
+void updateZone(float cm) {
+  TankZone z = zoneForDistance(cm);
+  if (z != lastZone) {
+    lastZone = z;
+    EEPROM.write(EEPROM_ZONE, (uint8_t)z);
+    EEPROM.commit();
+  }
+}
+
+void processWaterLevelData(float ultrasonicReading, bool estimated) {
   if (!tankConfig.enabled) {
     return;
   }
 
+  float blind = sensorBlindZone();
   tankData.lastDistance = ultrasonicReading;
 
   if (ultrasonicReading > tankConfig.height) {
     ultrasonicReading = tankConfig.height;
-  } else if (ultrasonicReading < SENSOR_BLIND_ZONE_CM) {
-    ultrasonicReading = SENSOR_BLIND_ZONE_CM;
+  } else if (ultrasonicReading < blind) {
+    ultrasonicReading = blind;
   }
 
-  float usableTankDepth = tankConfig.height - SENSOR_BLIND_ZONE_CM;
+  float usableTankDepth = tankConfig.height - blind;
   float waterLevel = tankConfig.height - ultrasonicReading;
   float waterPercent = (waterLevel / usableTankDepth) * 100.0;
 
@@ -1606,7 +1996,10 @@ void processWaterLevelData(float ultrasonicReading) {
   tankData.currentLevel = waterLevel;
   tankData.currentPercent = waterPercent;
   tankData.lastUpdate = millis();
-  tankData.lastDataTime = tankData.lastUpdate;
+  if (!estimated) {
+    tankData.lastDataTime = tankData.lastUpdate;  // "Last good reading" stays on the real one
+  }
+  zoneEstimate = estimated;
   tankData.isOnline = true;
   tankData.hasData = true;
 
@@ -1627,6 +2020,10 @@ void processWaterLevelData(float ultrasonicReading) {
   historyOnReading(waterPercent, waterLevel);
 }
 
+void processWaterLevelData(float ultrasonicReading) {
+  processWaterLevelData(ultrasonicReading, false);
+}
+
 // Any sign of life from the sensor (data, heartbeat or a repeated packet)
 void markSensorAlive(uint8_t via, int rssi) {
   tankData.lastUpdate = millis();
@@ -1637,41 +2034,165 @@ void markSensorAlive(uint8_t via, int rssi) {
   }
 }
 
-// Wired: poll the sensor on this monitor's own pins
-void pollWiredSensor() {
-  if (!tankConfig.enabled) return;
-
-  int echoes = 0;
-  float distance = readDistanceCM(&echoes);
-
+// End of one wired read cycle - same rules for every wired sensor type:
+//   valid distance          -> LIVE (zone remembered)
+//   answered, no distance   -> HEARTBEAT; UPPER zone shows Full, LOWER shows Empty, else last value
+//   silent                  -> after 3 cycles: CHECK SENSOR (last value kept)
+void finishWiredCycle(float distance, bool answered) {
   if (distance >= 0) {
     wiredNoEchoCycles = 0;
     markSensorAlive(VIA_WIRED, 0);
     tankData.lastWasHeartbeat = false;
     tankData.packets++;
-    processWaterLevelData(distance);
-
+    updateZone(distance);
+    processWaterLevelData(distance, false);
     #if DEBUG_MODE
     Serial.printf("Tank (%s): %.1fcm -> %.1f%%\n", tankConfig.customName, distance, tankData.currentPercent);
     #endif
     return;
   }
 
-  // Water right under the sensor (tank full) can silence it too - treat as alive, not disconnected
-  bool nearFull = tankData.hasData && tankData.lastDistance > 0 &&
-                  tankData.lastDistance < SENSOR_BLIND_ZONE_CM + 10;
-
-  if (echoes > 0 || nearFull) {
-    // Sensor answers but could not measure - heartbeat, keep last known value
+  if (answered) {
     wiredNoEchoCycles = 0;
     markSensorAlive(VIA_WIRED, 0);
     tankData.lastWasHeartbeat = true;
     tankData.heartbeats++;
-  } else {
-    if (wiredNoEchoCycles < 255) wiredNoEchoCycles++;
-    if (wiredNoEchoCycles == WIRED_OFFLINE_CYCLES) {
-      Serial.println("Wired sensor: no echo - check the sensor cable");
+    if (lastZone == ZONE_UPPER) {
+      processWaterLevelData(sensorBlindZone(), true);   // Water at the sensor - Full
+    } else if (lastZone == ZONE_LOWER) {
+      processWaterLevelData(tankConfig.height, true);   // Beam past the floor - Empty
     }
+    return;
+  }
+
+  if (wiredNoEchoCycles < 255) wiredNoEchoCycles++;
+  if (wiredNoEchoCycles == WIRED_OFFLINE_CYCLES) {
+    Serial.println("Wired sensor not responding - check the sensor and its cable");
+  }
+}
+
+// Wired: poll the sensor on this monitor's own pins
+void pollWiredSensor() {
+  if (!tankConfig.enabled) return;
+
+  if (wiredType == WS_TRIG_ECHO) {
+    static unsigned long lastRead = 0;
+    if (millis() - lastRead < SENSOR_READ_INTERVAL_MS) return;
+    lastRead = millis();
+    int echoes = 0;
+    float distance = readDistanceCM(&echoes);
+    finishWiredCycle(distance, echoes > 0);
+    return;
+  }
+
+  // UART not found yet - retry detection now and then
+  if (wiredType == WS_UART && uartActive == UART_DETECT) {
+    if (lastUartDetect == 0 || millis() - lastUartDetect >= UART_DETECT_RETRY_MS) {
+      detectUartSensor();
+    }
+    static unsigned long lastMiss = 0;
+    if (millis() - lastMiss >= SENSOR_READ_INTERVAL_MS) {
+      lastMiss = millis();
+      finishWiredCycle(-1, false);
+    }
+    return;
+  }
+
+  // Serial sensors: one reading per loop pass (each takes ~100-200 ms), so the
+  // web page and button stay responsive. SERIAL_SAMPLES readings make one cycle.
+  if (serialSampleCount == 0 && millis() - serialCycleStart < SENSOR_READ_INTERVAL_MS) return;
+  if (millis() - lastSerialSample < 160) return;  // DYP needs > 150 ms between triggers
+  if (serialSampleCount == 0) {
+    serialCycleStart = millis();
+    serialValidCount = 0;
+    serialAnswered = false;
+  }
+  lastSerialSample = millis();
+
+  float cm = -1;
+  SampleResult r = readSerialSample(&cm);
+  if (r != SAMPLE_SILENT) serialAnswered = true;
+  if (r == SAMPLE_VALID) serialSamples[serialValidCount++] = cm;
+  serialSampleCount++;
+
+  if (serialSampleCount >= SERIAL_SAMPLES) {
+    float distance = (serialValidCount >= SERIAL_MIN_VALID) ? madFilteredMedian(serialSamples, serialValidCount) : -1;
+    serialSampleCount = 0;
+    finishWiredCycle(distance, serialAnswered);
+  }
+}
+
+// Diagnostics: SENSOR RAW - one trigger, every byte that comes back (hex)
+void sensorRawDump() {
+  Serial.printf("\n--- SENSOR RAW: %s ---\n", wiredTypeName(wiredType));
+  if (wiredType == WS_TRIG_ECHO) {
+    for (int i = 0; i < 5; i++) {
+      long d = readEchoDuration();
+      Serial.printf("Pulse %d: %ld us = %.1f cm\n", i + 1, d, d * 0.0343 / 2);
+      delay(READING_DELAY);
+    }
+    Serial.println("--- done ---");
+    return;
+  }
+
+  while (sensorSerial.available()) sensorSerial.read();
+  if (wiredType == WS_MODBUS) {
+    uint8_t req[8] = {modbusAddress, 0x03, (uint8_t)(MODBUS_REG_REALTIME >> 8), (uint8_t)(MODBUS_REG_REALTIME & 0xFF), 0x00, 0x01, 0, 0};
+    uint16_t crc = modbusCRC16(req, 6);
+    req[6] = crc & 0xFF;
+    req[7] = crc >> 8;
+    Serial.print("TX: ");
+    for (int i = 0; i < 8; i++) Serial.printf("%02X ", req[i]);
+    Serial.println();
+    rs485Send(req, 8);
+  } else if (wiredType == WS_RS485_BRIDGE) {
+    uint8_t trig = RS485_BRIDGE_TRIGGER;
+    Serial.println("TX: 55");
+    rs485Send(&trig, 1);
+  } else if (uartActive == UART_CONTROLLED_9600) {
+    Serial.println("TX: 55");
+    sensorSerial.write((uint8_t)RS485_BRIDGE_TRIGGER);
+    sensorSerial.flush();
+  } else {
+    Serial.printf("Listening (%s)\n", uartModeName(uartActive));
+  }
+
+  Serial.print("RX: ");
+  int n = 0;
+  unsigned long start = millis();
+  while (millis() - start < 1500 && n < 64) {
+    if (sensorSerial.available()) {
+      Serial.printf("%02X ", sensorSerial.read());
+      n++;
+    }
+  }
+  Serial.printf(n ? "(%d bytes)\n" : "(nothing - 0 bytes)\n", n);
+  Serial.println("--- done ---");
+}
+
+// Diagnostics: SENSOR TEST - one decoded reading
+void sensorTest() {
+  Serial.printf("\n--- SENSOR TEST: %s ---\n", wiredTypeName(wiredType));
+  if (wiredType == WS_TRIG_ECHO) {
+    int echoes = 0;
+    float d = readDistanceCM(&echoes);
+    if (d >= 0) Serial.printf("Distance: %.1f cm (%d echoes)\n", d, echoes);
+    else Serial.printf("No valid distance (%d echoes)\n", echoes);
+    return;
+  }
+  float cm = -1;
+  SampleResult r = readSerialSample(&cm);
+  if (r == SAMPLE_VALID) {
+    Serial.printf("Distance: %.1f cm\n", cm);
+  } else if (r == SAMPLE_ANSWERED) {
+    Serial.printf("Sensor answered but no valid distance (range %.0f-%.0f cm)\n", sensorBlindZone(), sensorMaxRange());
+  } else {
+    Serial.println("No reply - check wiring, power and settings");
+  }
+  if (lastRawLen) {
+    Serial.print("Last frame: ");
+    for (int i = 0; i < lastRawLen; i++) Serial.printf("%02X ", lastRawFrame[i]);
+    Serial.println();
   }
 }
 
@@ -1687,6 +2208,17 @@ LinkState getLinkState() {
     return LS_OFFLINE;
   }
   return tankData.lastWasHeartbeat ? LS_HEARTBEAT : LS_LIVE;
+}
+
+// Customer wording for a silent sensor - never "offline"
+const char* silentText() {
+  return (linkType == LINK_WIRED) ? "CHECK SENSOR" : "NO SIGNAL";
+}
+
+// Zone estimate label while in heartbeat: "Full" / "Empty" / ""
+const char* zoneEstimateText() {
+  if (!zoneEstimate) return "";
+  return (lastZone == ZONE_UPPER) ? "Full" : ((lastZone == ZONE_LOWER) ? "Empty" : "");
 }
 
 const char* linkStateKey(LinkState s) {
@@ -2100,6 +2632,7 @@ void startSensorScan() {
 void startLinks() {
   if (linkType == LINK_WIRED) {
     Serial.println("Connection: Wired");
+    startWiredSensor();
     return;
   }
 
@@ -2802,15 +3335,20 @@ void showTankScreen() {
   u8g2.drawStr(16, 8, tankConfig.customName);
   const char* tag = "";
   if (state == LS_HEARTBEAT) tag = "[HB]";
-  else if (state == LS_OFFLINE) tag = "OFFLINE";
+  else if (state == LS_OFFLINE) tag = (linkType == LINK_WIRED) ? "CHECK" : "NO SIG";
   else if (state == LS_WAITING) tag = "WAIT";
   u8g2.drawStr(70, 8, tag);
   drawHeart(114, 0, alive);
 
   if (!tankData.hasData) {
     u8g2.setFont(u8g2_font_6x10_tr);
-    u8g2.drawStr(16, 32, state == LS_OFFLINE ? "Sensor offline" : "Waiting for");
-    u8g2.drawStr(16, 44, state == LS_OFFLINE ? "Check sensor" : "sensor data...");
+    if (state == LS_OFFLINE) {
+      u8g2.drawStr(16, 32, silentText());
+      u8g2.drawStr(16, 44, linkType == LINK_WIRED ? "Not responding" : "From sensor");
+    } else {
+      u8g2.drawStr(16, 32, "Waiting for");
+      u8g2.drawStr(16, 44, "sensor data...");
+    }
   } else {
     // Big percentage
     u8g2.setFont(u8g2_font_logisoso22_tr);
@@ -2840,10 +3378,18 @@ void showTankScreen() {
 
   // Bottom row: link in use + signal, or how long ago we last heard the sensor
   u8g2.setFont(u8g2_font_5x7_tr);
-  if (state == LS_OFFLINE || state == LS_HEARTBEAT) {
-    String ago = String(state == LS_OFFLINE ? "Last seen " : "Last read ");
-    unsigned long since = (state == LS_OFFLINE) ? tankData.lastUpdate : tankData.lastDataTime;
-    ago += (tankData.everHeard && since > 0) ? formatAge(millis() - since) + " ago" : String("--");
+  if (state == LS_HEARTBEAT && zoneEstimate) {
+    // Zone estimate: sensor answers but can't measure at the very top/bottom of the tank
+    u8g2.drawStr(16, 64, lastZone == ZONE_UPPER ? "Full - sensor blind" : "Empty - beyond range");
+  } else if (state == LS_OFFLINE || state == LS_HEARTBEAT) {
+    String ago;
+    if (state == LS_OFFLINE) {
+      ago = String(silentText()) + " ";
+      ago += tankData.everHeard ? formatAge(millis() - tankData.lastUpdate) : String("--");
+    } else {
+      ago = "Last read ";
+      ago += (tankData.lastDataTime > 0) ? formatAge(millis() - tankData.lastDataTime) + " ago" : String("--");
+    }
     u8g2.drawStr(16, 64, ago.c_str());
   } else {
     uint8_t via = (linkType == LINK_WIRED) ? (uint8_t)VIA_WIRED : tankData.via;
@@ -2908,7 +3454,7 @@ void showAlarmScreen() {
   if (tankConfig.enabled && tankData.hasData) {
     String alarmText = "";
     if (!tankData.isOnline) {
-      alarmText = String(tankConfig.customName) + ": OFFLINE";
+      alarmText = String(tankConfig.customName) + ": No response";
     } else {
       if (tankConfig.lowAlarmPercent > 0 && tankData.currentPercent < tankConfig.lowAlarmPercent) {
         alarmText = String(tankConfig.customName) + ": LOW (" + String((int)round(tankData.currentPercent)) + "%)";
@@ -2976,13 +3522,28 @@ void showSensorTechScreen() {
   u8g2.drawStr(0, 24, line.c_str());
 
   if (linkType == LINK_WIRED) {
-    line = "Echo: " + String(wiredNoEchoCycles >= WIRED_OFFLINE_CYCLES ? "NONE" : "OK");
+    line = String(wiredTypeName(wiredType));
+    if (wiredType == WS_MODBUS) line += " #" + String(modbusAddress);
   } else {
     line = "ID: " + String(tankConfig.nodeID[0] ? tankConfig.nodeID : "not paired");
   }
   u8g2.drawStr(0, 34, line.c_str());
 
-  if (linkType != LINK_WIRED && tankData.rssi != 0) {
+  if (linkType == LINK_WIRED) {
+    if (wiredType == WS_UART) {
+      line = uartModeName(uartActive);
+    } else if (wiredType == WS_TRIG_ECHO) {
+      line = "Echo: " + String(wiredNoEchoCycles >= WIRED_OFFLINE_CYCLES ? "none" : "ok");
+    } else {
+      line = "Frame:";
+      for (int i = 0; i < lastRawLen && i < 7; i++) {
+        char hx[4];
+        snprintf(hx, sizeof(hx), " %02X", lastRawFrame[i]);
+        line += hx;
+      }
+      if (lastRawLen == 0) line += " none";
+    }
+  } else if (tankData.rssi != 0) {
     line = "Signal: " + String(tankData.rssi) + " dBm";
   } else if (linkType == LINK_LONG_RANGE && !loraPresent) {
     line = "Long Range: no module";
@@ -3070,8 +3631,23 @@ void handleSerialCommands() {
       }
     } else if (command == "LINK") {
       configureConnection();
+    } else if (command == "SENSOR" || command == "SENSOR RAW" || command == "SENSOR TEST") {
+      if (linkType != LINK_WIRED) {
+        Serial.println("SENSOR commands are for Wired sensors. Current connection: " + String(linkTypeName(linkType)));
+      } else if (command == "SENSOR RAW") {
+        sensorRawDump();
+      } else if (command == "SENSOR TEST") {
+        sensorTest();
+      } else {
+        Serial.printf("Wired sensor: %s | range %.0f-%.0f cm\n", wiredTypeName(wiredType), sensorBlindZone(), sensorMaxRange());
+        if (wiredType == WS_UART) Serial.printf("UART: setting %s, running %s\n",
+                                                uartSetting == UART_DETECT ? "auto-detect" : uartModeName(uartSetting), uartModeName(uartActive));
+        if (wiredType == WS_MODBUS) Serial.printf("Modbus: address %u, register 0x%04X (real-time), %d baud\n", modbusAddress, MODBUS_REG_REALTIME, RS485_BAUD);
+        if (wiredType == WS_RS485_BRIDGE) Serial.printf("Bridge: %d baud, trigger 0x%02X\n", RS485_BAUD, RS485_BRIDGE_TRIGGER);
+        Serial.println("Commands: SENSOR RAW (raw bytes), SENSOR TEST (one decoded reading)");
+      }
     } else {
-      Serial.println("Available commands: CONFIG, STATUS, ALARM, WIFI, LINK, HISTORY, RESET, RESTART, MUTE, UNMUTE, MUTESTATUS");
+      Serial.println("Available commands: CONFIG, STATUS, ALARM, WIFI, LINK, HISTORY, SENSOR, SENSOR RAW, SENSOR TEST, RESET, RESTART, MUTE, UNMUTE, MUTESTATUS");
     }
   }
 }
@@ -3337,9 +3913,10 @@ void handleAPIStatus() {
     if (!tankData.isOnline && !alarmAck.tankOfflineAck) {
       JsonObject alarm = activeAlarms.createNestedObject();
       tankConfig.customName[8] = '\0'; // Ensure null termination
-      alarm["type"] = "Tank Offline";
+      alarm["type"] = "Sensor Not Responding";
       alarm["sensor"] = String(tankConfig.customName);
-      alarm["message"] = "Tank sensor is offline (no reading received)";
+      alarm["message"] = (linkType == LINK_WIRED) ? "Check the sensor and its cable (no response)"
+                                                  : "No signal from the sensor - check its power and range";
     }
   }
 
@@ -3362,6 +3939,7 @@ void handleAPIStatus() {
     tank["state"] = linkStateKey(state);
     tank["lastData"] = tankData.hasData ? millis() - tankData.lastDataTime : 0;
     tank["levelFtIn"] = formatFeetInches(tankData.currentLevel);
+    tank["estimate"] = zoneEstimateText();
     tank["litres"] = currentLitres();
     tank["volume"] = tankConfig.volume;
     tank["height"] = tankConfig.height;
@@ -3374,7 +3952,8 @@ void handleAPIStatus() {
     link["type"] = linkTypeName(linkType);
     uint8_t via = (linkType == LINK_WIRED) ? (uint8_t)VIA_WIRED : tankData.via;
     link["via"] = (via == VIA_NONE) ? linkTypeName(linkType) : linkViaName(via);
-    link["sensor"] = tankConfig.nodeID;
+    link["sensor"] = (linkType == LINK_WIRED) ? String(wiredTypeName(wiredType)) : String(tankConfig.nodeID);
+    link["wired"] = (linkType == LINK_WIRED);
     link["rssi"] = tankData.rssi;
     link["bars"] = signalBars();
   }
@@ -3427,6 +4006,10 @@ void handleConfigAPI() {
   link["longRangeModule"] = loraPresent;
   link["longRangeChecked"] = linkUsesLoRa();
   link["wifiConnected"] = wifiStationMode;
+  link["wiredType"] = (int)wiredType;
+  link["modbusAddr"] = modbusAddress;
+  link["uartMode"] = (int)uartSetting;
+  link["uartActive"] = (linkType == LINK_WIRED && wiredType == WS_UART) ? uartModeName(uartActive) : "";
 
   JsonObject logging = doc.createNestedObject("logging");
   logging["threshold"] = logThresholdPercent;
@@ -3478,6 +4061,30 @@ void handleLinkUpdate() {
 
   bool changed = (t != (int)linkType);
   linkType = (LinkType)t;
+
+  // Wired sensor settings
+  if (server.hasArg("wiredType")) {
+    int w = server.arg("wiredType").toInt();
+    if (w >= 0 && w < WIRED_TYPE_COUNT && w != (int)wiredType) {
+      wiredType = (WiredSensorType)w;
+      changed = changed || linkType == LINK_WIRED;
+    }
+  }
+  if (server.hasArg("modbusAddr")) {
+    int a = server.arg("modbusAddr").toInt();
+    if (a >= 1 && a <= 247 && a != modbusAddress) {
+      modbusAddress = a;
+      changed = changed || (linkType == LINK_WIRED && wiredType == WS_MODBUS);
+    }
+  }
+  if (server.hasArg("uartMode")) {
+    int u = server.arg("uartMode").toInt();
+    if (u >= UART_DETECT && u <= UART_CONTROLLED_9600 && u != (int)uartSetting) {
+      uartSetting = (UartMode)u;
+      if (uartSetting == UART_DETECT) saveUartDetected(UART_DETECT);  // Detect again from scratch
+      changed = changed || (linkType == LINK_WIRED && wiredType == WS_UART);
+    }
+  }
   saveLinkSettings();
   server.send(200, "application/json", changed ? "{\"success\":true,\"restart\":true}" : "{\"success\":true}");
   if (changed) {
@@ -3657,7 +4264,11 @@ table.hist td,table.hist th{padding:3px 6px;border-bottom:1px solid #eee;text-al
 function timeAgo(ms){if(!ms||ms<=0)return '';const s=Math.round(ms/1000);
 if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';return Math.floor(s/3600)+'h ago';}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-const STATE_TEXT={live:'Live',heartbeat:'Sensor alive - showing last reading',offline:'Offline - showing last reading',waiting:'Waiting for sensor'};
+const STATE_TEXT={live:'Live',heartbeat:'Sensor alive - showing last reading',waiting:'Waiting for sensor'};
+function stateText(st,link,tank){
+if(st==='offline')return link.wired?'Check sensor - not responding (showing last reading)':'No signal from sensor (showing last reading)';
+if(st==='heartbeat'&&tank.estimate)return 'Sensor alive - tank '+(tank.estimate==='Full'?'full (sensor blind)':'empty (beyond range)');
+return STATE_TEXT[st];}
 function bars(n){let h='<span class="bars">';for(let i=0;i<3;i++){h+='<i class="'+(i<n?'on':'')+'" style="height:'+(4+i*4)+'px"></i>';}return h+'</span>';}
 function buildStatusHTML(data){
 try{
@@ -3681,7 +4292,7 @@ html+='<div class="mini-tank"><div class="mt-cap"></div><div class="mt-top"></di
 html+='<div class="mt-water'+(st==='live'?'':' stale')+'" style="height:'+(has?pct:0)+'%"></div></div></div>';
 html+='<div class="tank-details"><a class="gear" href="/config" title="Settings">&#x2699;</a>';
 html+='<strong>'+esc(tank.name||'Tank')+'</strong><br>';
-html+='<span class="pill st-'+st+'"><span class="heart'+(alive?' beat':'')+'">'+(alive?'&#9829;':'&#9825;')+'</span>'+STATE_TEXT[st]+'</span>';
+html+='<span class="pill st-'+st+'"><span class="heart'+(alive?' beat':'')+'">'+(alive?'&#9829;':'&#9825;')+'</span>'+stateText(st,link,tank)+'</span>';
 if(tank.lastUpdate){html+=' <span class="ago">'+(st==='live'?'updated ':'last seen ')+timeAgo(tank.lastUpdate)+'</span>';}
 if(has){
 html+='<div><span class="big">'+pct+'%</span>';
@@ -3692,7 +4303,7 @@ html+='<div class="row">Water height: <strong>'+tank.level.toFixed(0)+' cm</stro
 if(tank.volume>0){html+='<div class="row">Volume: <strong>'+tank.litres+' L</strong> / '+tank.volume+' L</div>';}
 if(st==='heartbeat'&&tank.lastData){html+='<div class="row ago">Last good reading '+timeAgo(tank.lastData)+'</div>';}
 }else{html+='<div class="row">No reading yet</div>';}
-html+='<div class="row ago">Connection: '+esc(link.via||link.type||'')+(link.bars>0?bars(link.bars):'')+(link.sensor?' &middot; Sensor '+esc(link.sensor):'')+'</div>';
+html+='<div class="row ago">Connection: '+esc(link.via||link.type||'')+(link.bars>0?bars(link.bars):'')+(link.sensor?' &middot; '+(link.wired?'':'Sensor ')+esc(link.sensor):'')+'</div>';
 html+='</div></div></div>';
 }else{html+='<div class="status">No tank sensor configured</div>';}
 return html;
@@ -4024,6 +4635,19 @@ static const char CONFIG_LINK_SECTION[] = R"rawliteral(
 <label class='lk-opt' data-v='2'><input type='radio' name='lk' value='2'><div><div class='lk-title'>NearbyConnect</div><div class='lk-desc'>Sensor and display talk directly to each other, up to about 200 m in open space (less through thick walls). No router or internet needed.</div></div></label>
 <label class='lk-opt' data-v='3'><input type='radio' name='lk' value='3'><div><div class='lk-title'>Home Network</div><div class='lk-desc'>Sensor and display both join your home WiFi. <strong>Both must be on the same WiFi network.</strong> Works anywhere your WiFi reaches. NearbyConnect is used as a backup if the router is off.</div></div></label>
 </div>
+<div id='wired-box' style='display:none'>
+<div class='fg'><label>Wired sensor type</label>
+<label class='lk-opt' data-w='0'><input type='radio' name='wt' value='0'><div><div class='lk-title'>Standard (Trig/Echo)</div><div class='lk-desc'>Ultrasonic sensor with TRIG and ECHO wires. Cable up to about 50 m.</div></div></label>
+<label class='lk-opt' data-w='1'><input type='radio' name='wt' value='1'><div><div class='lk-title'>UART</div><div class='lk-desc'>Ultrasonic sensor with RX/TX serial wires connected directly. Short cable. Detected automatically.</div></div></label>
+<label class='lk-opt' data-w='2'><input type='radio' name='wt' value='2'><div><div class='lk-title'>RS485 (UART bridge)</div><div class='lk-desc'>UART ultrasonic sensor connected through an RS485 converter. Long cable runs.</div></div></label>
+<label class='lk-opt' data-w='3'><input type='radio' name='wt' value='3'><div><div class='lk-title'>RS485 Modbus</div><div class='lk-desc'>Ultrasonic sensor with a native RS485 Modbus output. Long cable runs.</div></div></label>
+</div>
+<div class='fg' id='uart-box' style='display:none'><label>UART sensor mode</label>
+<select id='uart-mode'><option value='0'>Detect automatically (recommended)</option><option value='1'>Auto-stream, 9600 baud</option><option value='2'>Auto-stream, 115200 baud</option><option value='3'>Controlled, 9600 baud</option></select>
+<small id='uart-found'></small></div>
+<div class='fg' id='modbus-box' style='display:none'><label>Modbus sensor address</label>
+<input type='number' id='modbus-addr' min='1' max='247' value='1'><small>Usually 1 - printed in the sensor's manual</small></div>
+</div>
 <div class='lk-warn' id='lk-warn'></div>
 <button class='btn btn-p btn-full' onclick='saveLink()'>Save Connection Type</button>
 <small style='color:#888'>The display restarts after the connection type changes.</small>
@@ -4056,17 +4680,29 @@ static const char CONFIG_LOGGING_SECTION[] = R"rawliteral(
 
 static const char CONFIG_LINK_SCRIPT[] = R"rawliteral(
 let linkCfg={};
-function selLink(v){document.querySelectorAll('.lk-opt').forEach(o=>{const on=o.dataset.v==String(v);o.classList.toggle('sel',on);o.querySelector('input').checked=on;});
+function selLink(v){document.querySelectorAll('.lk-opt[data-v]').forEach(o=>{const on=o.dataset.v==String(v);o.classList.toggle('sel',on);o.querySelector('input').checked=on;});
 const w=document.getElementById('lk-warn');let msg='';
 if(v==1&&linkCfg.longRangeChecked&&!linkCfg.longRangeModule)msg='Long Range module was not detected in this display.';
 if(v==3&&!linkCfg.wifiConnected)msg='This display is not connected to WiFi. Enter your WiFi details on both the sensor and this display.';
 w.textContent=msg;w.style.display=msg?'block':'none';
-document.getElementById('pair-box').style.display=(v==0)?'none':'block';}
-function renderLink(l){linkCfg=l;selLink(l.type!=null?l.type:4);
+document.getElementById('pair-box').style.display=(v==0)?'none':'block';
+document.getElementById('wired-box').style.display=(v==0)?'block':'none';}
+function selWired(w){document.querySelectorAll('.lk-opt[data-w]').forEach(o=>{const on=o.dataset.w==String(w);o.classList.toggle('sel',on);o.querySelector('input').checked=on;});
+document.getElementById('uart-box').style.display=(w==1)?'block':'none';
+document.getElementById('modbus-box').style.display=(w==3)?'block':'none';}
+function renderLink(l){linkCfg=l;selLink(l.type!=null?l.type:4);selWired(l.wiredType||0);
 document.getElementById('pair-current').textContent=l.sensor||'none';
-document.querySelectorAll('.lk-opt').forEach(o=>{o.onclick=()=>selLink(o.dataset.v);});}
+document.getElementById('modbus-addr').value=l.modbusAddr||1;
+document.getElementById('uart-mode').value=l.uartMode||0;
+document.getElementById('uart-found').textContent=l.uartActive?('Running: '+l.uartActive):'';
+document.querySelectorAll('.lk-opt[data-v]').forEach(o=>{o.onclick=()=>selLink(o.dataset.v);});
+document.querySelectorAll('.lk-opt[data-w]').forEach(o=>{o.onclick=()=>selWired(o.dataset.w);});}
 function saveLink(){const s=document.querySelector('input[name=lk]:checked');if(!s)return;
 const fd=new FormData();fd.append('type',s.value);
+const w=document.querySelector('input[name=wt]:checked');if(w)fd.append('wiredType',w.value);
+const a=parseInt(document.getElementById('modbus-addr').value);
+if(w&&w.value=='3'&&(!(a>=1)||a>247)){showToast('Modbus address must be 1-247',true);return;}
+fd.append('modbusAddr',a||1);fd.append('uartMode',document.getElementById('uart-mode').value);
 fetch('/api/link',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{
 if(d.error)showToast(d.error,true);else if(d.restart){showToast('Saved. Restarting...');setTimeout(()=>location.reload(),8000);}else showToast('Saved!');
 }).catch(()=>{showToast('Saved. Restarting...');setTimeout(()=>location.reload(),8000);});}
@@ -4257,7 +4893,7 @@ String getConfigPageHTML() {
   html += "const box=document.getElementById('tank-content');";
   html += "if(!t.enabled){";
   html += "box.innerHTML=`<div class='fg'><label>Sensor Name</label><input type='text' id='tank-name' placeholder='e.g., MainTank' maxlength='8'><small>Max 8 characters, letters and numbers only</small></div>";
-  html += "<div class='fg'><label>Height (cm)</label><input type='number' id='tank-height' min='50' max='450' placeholder='e.g., 150'><small>Measure from the sensor to the base of the tank</small></div>";
+  html += "<div class='fg'><label>Height (cm)</label><input type='number' id='tank-height' min='50' max='750' placeholder='e.g., 150'><small>Measure from the sensor to the base of the tank</small></div>";
   html += "<div class='fg'><label>Volume (Litres)</label><input type='number' id='tank-volume' min='0' max='99999' placeholder='e.g., 1000 (optional)'></div>";
   html += "<div class='fg'><label><input type='checkbox' id='tank-low-en' checked> Low Level Alarm</label>";
   html += "<input type='range' id='tank-low-slider' min='1' max='94' value='20' oninput='tankVizUpdate()'><span class='alarm-val' id='tank-low-val'>20%</span></div>";
@@ -4266,7 +4902,7 @@ String getConfigPageHTML() {
   html += "<button class='btn btn-s btn-full' onclick='saveTank()'>Add Tank Sensor</button>`;";
   html += "return;";
   html += "}";
-  html += "const stCls=t.online?'st-online':'st-offline';const stTxt=t.online?'Online':'Offline';";
+  html += "const stCls=t.online?'st-online':'st-offline';const stTxt=t.online?'Online':'Not responding';";
   html += "const lowEn=t.lowAlarm>0;const highEn=t.highAlarm>0;";
   html += "const lowVal=lowEn?t.lowAlarm:20;const highVal=highEn?t.highAlarm:90;";
   html += "let html=`<div style=\"margin-bottom:15px\"><span class='status-badge ${stCls}'>${stTxt}</span></div>`;";
@@ -4338,7 +4974,7 @@ String getConfigPageHTML() {
   html += "const n=document.getElementById('tank-name').value.trim();";
   html += "if(!n||n.length>8||!/^[a-zA-Z0-9]+$/.test(n)){showToast('Invalid name: max 8 chars, letters and numbers only',true);return;}";
   html += "const h=document.getElementById('tank-height').value;";
-  html += "if(!h||h<50||h>450){showToast('Height must be between 50 and 450 cm',true);return;}";
+  html += "if(!h||h<50||h>750){showToast('Height must be between 50 and 750 cm',true);return;}";
   html += "const v=document.getElementById('tank-volume').value||0;";
   html += "const lowEnEl=document.getElementById('tank-low-en');const highEnEl=document.getElementById('tank-high-en');";
   html += "const lowEn=lowEnEl?lowEnEl.checked:false;const highEn=highEnEl?highEnEl.checked:false;";
@@ -4544,11 +5180,7 @@ void loop() {
 
   // Sensor input: wired pins, or the wireless links
   if (linkType == LINK_WIRED) {
-    static unsigned long lastSensorRead = 0;
-    if (millis() - lastSensorRead > SENSOR_READ_INTERVAL_MS) {
-      pollWiredSensor();
-      lastSensorRead = millis();
-    }
+    pollWiredSensor();  // Paces itself: trig/echo burst every 2s, serial sensors one reading per pass
   } else {
     serviceLinks();
   }
@@ -4588,7 +5220,7 @@ void checkSensorOnlineStatus() {
     if (wasOnline && !tankData.isOnline) {
       Serial.print("Tank (");
       Serial.print(tankConfig.customName);
-      Serial.println(") went OFFLINE");
+      Serial.println(") not responding - check sensor");
     } else if (!wasOnline && tankData.isOnline) {
       // Clear stale alarm acknowledgments so alarms can re-trigger fresh after recovery
       if (alarmAck.tankLowThresholdAck) {
