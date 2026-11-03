@@ -1,7 +1,7 @@
 /*
  * SenseFlow Tank Sensor (Transmitter) - single tank, ultrasonic
  * ===============================================================
- * Firmware Version: 55.0.0
+ * Firmware Version: 55.1.0
  *
  * FEATURES:
  * - Connection type chosen on the setup page (saved in EEPROM):
@@ -16,6 +16,14 @@
  *     {"i":"US3847","s":51,"c":103,"h":1}     heartbeat - sensor alive, reading failed
  * - WiFi AP setup page (2 min, extends with activity, max 5 min) - closing the
  *   AP keeps the radio running for NearbyConnect / Home Network
+ * - Ultrasonic sensor type (setup page > Sensor Type, saved in EEPROM):
+ *     Standard (Trig/Echo) - HC-SR04 / JSN: TRIG 25, ECHO 34
+ *     UART                 - DYP-A01/A21: ESP TX 25 -> sensor RX, ESP RX 34 <- sensor TX
+ *     RS485 (UART bridge)  - DYP-A06 via TTL-RS485 bridge: RX 5, TX 17, DE/RE 25
+ *     RS485 Modbus         - Modbus-RTU sensor (reg 0x0101): RX 5, TX 17, DE/RE 25
+ *   RS485 uses GPIO5 = LoRa NSS, so RS485 sensors never have a Long Range module.
+ * - Extra payload flags: "e":1 = zone estimate (Full/Empty), "h":2 = ultrasonic
+ *   sensor not responding (display shows CHECK SENSOR)
  * - mvsOTA firmware updates
  * - MAD filtering + calibration + zone boundary logic
  *
@@ -49,7 +57,7 @@
 #include <esp_idf_version.h>
 #include <mvsota_esp32.h>
 
-#define FIRMWARE_VERSION "55.0.0"
+#define FIRMWARE_VERSION "55.1.0"
 #define FIRMWARE_CODE "SF-TC-2026-9867"
 
 // Debug mode: 0 = minimal serial output, 1 = full debug output (for developers)
@@ -91,12 +99,24 @@
 #define READING_DELAY 50
 #define MAD_MULTIPLIER 2.5
 
-// Zone definitions for Smart Boundary Logic
-#define UPPER_ZONE_MIN 20
-#define UPPER_ZONE_MAX 25
-#define MIDDLE_ZONE_MIN 26
-#define MIDDLE_ZONE_MAX 389
-#define LOWER_ZONE_MIN 390
+// Zone boundaries follow the selected sensor (see sensorBlindZone / sensorMaxRange):
+//   UPPER  = up to blind zone + 7 cm (tank nearly full)
+//   LOWER  = beyond 87% of max range (tank nearly empty)
+#define ZONE_UPPER_MARGIN_CM 7
+#define ZONE_LOWER_FRACTION 0.87f
+
+// Sensor types and serial sensor wiring
+#define SENSOR_UART_TX_PIN 25             // -> sensor RX (same terminal as TRIG)
+#define SENSOR_UART_RX_PIN 34             // <- sensor TX (same terminal as ECHO)
+#define RS485_RX_PIN 5                    // <- RS485 module RO (shares GPIO5 with LoRa NSS)
+#define RS485_TX_PIN 17                   // -> RS485 module DI
+#define RS485_DIR_PIN 25                  // RS485 module DE+RE, HIGH = transmit
+#define RS485_BAUD 9600
+#define RS485_BRIDGE_TRIGGER 0x55
+#define MODBUS_REG_REALTIME 0x0101        // Always real-time, never the processed register
+#define SERIAL_SAMPLES 7
+#define SERIAL_MIN_VALID 4
+#define SILENT_CYCLES_BEFORE_ALERT 3      // Silent readings before sending "h":2
 
 // EEPROM configuration
 #define EEPROM_SIZE 112
@@ -117,6 +137,11 @@
 #define EEPROM_CAL_SLOPE_ADDR 91          // 4 bytes (float slope)
 #define EEPROM_CAL_ENABLED_ADDR 95        // 1 byte (0=disabled, 1=enabled)
 #define EEPROM_CAL_VALID_ADDR 96          // 1 byte magic number
+// Sensor type EEPROM addresses (100-103)
+#define EEPROM_SENSOR_TYPE_ADDR 100       // 1 byte sensor type
+#define EEPROM_MODBUS_ADDR 101            // 1 byte Modbus address 1-247
+#define EEPROM_UART_SETTING_ADDR 102      // 1 byte UART mode setting (0 = auto-detect)
+#define EEPROM_UART_DETECTED_ADDR 103     // 1 byte UART mode found by auto-detect
 // Connection EEPROM addresses (97-99)
 #define EEPROM_LINK_TYPE_ADDR 97          // 1 byte connection type
 #define EEPROM_LINK_VALID_ADDR 98         // 1 byte magic number
@@ -157,6 +182,28 @@ enum LinkType : uint8_t {
 };
 #define TX_LINK_COUNT 5
 
+// Ultrasonic sensor type (stored in EEPROM)
+enum SensorType : uint8_t {
+  SENSOR_TRIG_ECHO = 0,
+  SENSOR_UART = 1,
+  SENSOR_RS485_BRIDGE = 2,
+  SENSOR_MODBUS = 3
+};
+#define SENSOR_TYPE_COUNT 4
+
+enum UartMode : uint8_t {
+  UART_DETECT = 0,
+  UART_STREAM_9600 = 1,
+  UART_STREAM_115200 = 2,
+  UART_CONTROLLED_9600 = 3
+};
+
+enum SampleResult : uint8_t {
+  SAMPLE_SILENT = 0,    // No echo / bytes / reply
+  SAMPLE_ANSWERED = 1,  // Answered, but no usable distance
+  SAMPLE_VALID = 2
+};
+
 // NearbyConnect sender state
 enum NearbyState : uint8_t {
   NB_IDLE = 0,
@@ -191,7 +238,20 @@ unsigned long restartAt = 0;
 // Last payload (also served to the display at /api/r for Home Network)
 char txPayload[96] = "";
 bool lastSentHasDistance = false;
+bool lastSentEstimate = false;
+uint8_t lastSentHeartbeat = 0;            // 0 = data, 1 = heartbeat, 2 = sensor silent
 int lastSentDistance = 0;
+
+// Ultrasonic sensor
+SensorType sensorType = SENSOR_TRIG_ECHO;
+uint8_t modbusAddress = 1;
+UartMode uartSetting = UART_DETECT;
+UartMode uartActive = UART_DETECT;
+unsigned long lastUartDetect = 0;
+HardwareSerial sensorSerial(2);
+uint8_t silentCycles = 0;
+uint8_t lastRawFrame[8];
+uint8_t lastRawLen = 0;
 
 // NearbyConnect sender
 const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -246,7 +306,7 @@ void handleGenerateID();
 void handleNotFound();
 bool checkUserAgent();
 void extendAPTimeout();
-float readDistanceCM();
+float readDistanceCM(bool* answered);
 void measurementCycle();
 void loadZoneFromEEPROM();
 void resetEEPROM();
@@ -333,9 +393,16 @@ void setup() {
   // Load zone from EEPROM
   loadZoneFromEEPROM();
 
+  // Ultrasonic sensor type (RS485 sensors use GPIO5, the LoRa NSS pin)
+  loadSensorSettings();
+
   // Detect the Long Range module first - Auto mode depends on it
-  SPI.begin();
-  loraInitialized = startLoRa();
+  if (sensorUsesRS485()) {
+    loraInitialized = false;  // RS485 boards have no Long Range module - don't drive its pins
+  } else {
+    SPI.begin();
+    loraInitialized = startLoRa();
+  }
 
   // Decide which links run this session
   resolveActiveLinks();
@@ -359,6 +426,9 @@ void setup() {
   if (useNearby) {
     nearbyReady = startNearby();
   }
+
+  // Bring up the ultrasonic sensor interface
+  startSensor();
 
   Serial.print(F("Connection: "));
   Serial.println(linkTypeName(linkType));
@@ -386,6 +456,9 @@ void loop() {
 
   // Handle web server
   server.handleClient();
+
+  // SENSOR / SENSOR RAW / SENSOR TEST diagnostics
+  handleSerialCommands();
 
   // Handle OTA
   if (!mvsota.isUpdating()) {
@@ -774,6 +847,9 @@ void handleDashboard() {
   if (server.hasArg("error")) {
     html += "<div class='error'>Home Network needs your WiFi name and password below.</div>";
   }
+  if (server.hasArg("error") && server.arg("error") == "2") {
+    html += "<div class='error'>RS485 sensors can't be used with Long Range - pick NearbyConnect or Home Network.</div>";
+  }
   if (server.hasArg("restart")) {
     html += "<div class='success'>Connection type changed - the sensor is restarting.</div>";
   }
@@ -782,6 +858,7 @@ void handleDashboard() {
   html += "<div class='card'>";
   html += "<h3>Status <span style='font-size:0.8em;color:#aaa'>(auto-refresh)</span></h3>";
   html += "<div class='info-row'><span class='label'>Sensor ID</span><span class='value'>" + getUSNodeID() + "</span></div>";
+  html += "<div class='info-row'><span class='label'>Sensor Type</span><span class='value'>" + String(sensorTypeName(sensorType)) + "</span></div>";
   html += "<div class='info-row'><span class='label'>Connection</span><span class='value' id='linkStatus'>" + getLinkStatusString() + "</span></div>";
   html += "<div class='info-row'><span class='label'>Firmware</span><span class='value'>v" + String(FIRMWARE_VERSION) + "</span></div>";
   html += "<div class='info-row'><span class='label'>Long Range module</span><span class='value'>" + String(loraInitialized ? "Detected" : "Not fitted") + "</span></div>";
@@ -810,6 +887,41 @@ void handleDashboard() {
   html += "<button type='button' class='btn btn-secondary' onclick='generateID()'>Random ID</button>";
   html += "</div>";
 
+  // Sensor Type Card
+  html += "<div class='card'>";
+  html += "<h3>Sensor Type</h3>";
+  html += "<div class='radio-group'>";
+  const char* sensorTitles[SENSOR_TYPE_COUNT] = {
+    "Standard (Trig/Echo)", "UART", "RS485 (UART bridge)", "RS485 Modbus"
+  };
+  const char* sensorDescs[SENSOR_TYPE_COUNT] = {
+    "Ultrasonic sensor with TRIG and ECHO wires (HC-SR04 / JSN). Cable up to about 50 m.",
+    "Ultrasonic sensor with RX/TX serial wires (DYP-A01 / A21). Short cable. Detected automatically.",
+    "UART ultrasonic sensor through an RS485 converter (DYP-A06). Long cable. No Long Range module.",
+    "Ultrasonic sensor with native RS485 Modbus output. Long cable. No Long Range module."
+  };
+  for (int i = 0; i < SENSOR_TYPE_COUNT; i++) {
+    bool sel = ((int)sensorType == i);
+    html += "<label class='radio-option sensor-opt" + String(sel ? " selected" : "") + "' onclick='selectSensor(" + String(i) + ")'>";
+    html += "<input type='radio' name='sensorType' value='" + String(i) + "'" + String(sel ? " checked" : "") + ">";
+    html += "<div class='radio-circle'></div>";
+    html += "<div class='radio-text'><div class='radio-title'>" + String(sensorTitles[i]) + "</div>";
+    html += "<div class='radio-desc'>" + String(sensorDescs[i]) + "</div></div></label>";
+  }
+  html += "</div>";
+  html += "<div class='form-group' id='uartBox' style='display:" + String(sensorType == SENSOR_UART ? "block" : "none") + "'>";
+  html += "<label>UART sensor mode</label><select name='uartMode' style='width:100%;padding:10px;background:#1a1a2e;color:#fff;border:2px solid #0f3460;border-radius:6px'>";
+  const char* uartOpts[4] = {"Detect automatically (recommended)", "Auto-stream, 9600 baud", "Auto-stream, 115200 baud", "Controlled, 9600 baud"};
+  for (int i = 0; i < 4; i++) {
+    html += "<option value='" + String(i) + "'" + String((int)uartSetting == i ? " selected" : "") + ">" + uartOpts[i] + "</option>";
+  }
+  html += "</select><div class='note'>Running: " + String(uartModeName(uartActive)) + "</div></div>";
+  html += "<div class='form-group' id='modbusBox' style='display:" + String(sensorType == SENSOR_MODBUS ? "block" : "none") + "'>";
+  html += "<label>Modbus sensor address</label><input type='number' name='modbusAddr' min='1' max='247' value='" + String(modbusAddress) + "'>";
+  html += "<div class='note'>Usually 1 - see the sensor's manual</div></div>";
+  html += "<div class='note'>The sensor restarts when the sensor type changes.</div>";
+  html += "</div>";
+
   // Connection Type Card (customer-facing names only)
   html += "<div class='card'>";
   html += "<h3>Connection Type</h3>";
@@ -826,7 +938,7 @@ void handleDashboard() {
   };
   for (int i = 0; i < TX_LINK_COUNT; i++) {
     bool sel = ((int)linkType == i);
-    html += "<label class='radio-option" + String(sel ? " selected" : "") + "' onclick='selectLink(" + String(i) + ")'>";
+    html += "<label class='radio-option link-opt" + String(sel ? " selected" : "") + "' onclick='selectLink(" + String(i) + ")'>";
     html += "<input type='radio' name='linkType' value='" + String(i) + "'" + String(sel ? " checked" : "") + ">";
     html += "<div class='radio-circle'></div>";
     html += "<div class='radio-text'><div class='radio-title'>" + String(linkTitles[i]) + "</div>";
@@ -935,10 +1047,17 @@ void handleDashboard() {
   html += "else v='US'+v.substring(2).replace(/[^0-9]/g,'');";
   html += "if(v.length>6)v=v.substring(0,6);this.value=v;});";
 
+  // Sensor type selection
+  html += "function selectSensor(v){";
+  html += "document.querySelectorAll('input[name=sensorType]').forEach(function(r,i){r.checked=(i==v);});";
+  html += "document.querySelectorAll('.sensor-opt').forEach(function(o,i){o.classList.toggle('selected',i==v);});";
+  html += "document.getElementById('uartBox').style.display=(v==1)?'block':'none';";
+  html += "document.getElementById('modbusBox').style.display=(v==3)?'block':'none';}";
+
   // Connection type selection
   html += "function selectLink(v){";
   html += "var radios=document.querySelectorAll('input[name=linkType]');";
-  html += "var options=document.querySelectorAll('.radio-option');";
+  html += "var options=document.querySelectorAll('.link-opt');";
   html += "radios.forEach(function(r,i){r.checked=(i==v);});";
   html += "options.forEach(function(o,i){o.classList.toggle('selected',i==v);});";
   html += "if(v==3||v==4){var t=document.getElementById('wifiToggle');if(!t.checked){t.checked=true;toggleWifiSettings();}}}";
@@ -1053,6 +1172,23 @@ void handleSaveAll() {
     }
   }
 
+  // === Sensor Type === (applied with the connection type below)
+  SensorType newSensor = sensorType;
+  if (server.hasArg("sensorType")) {
+    int v = server.arg("sensorType").toInt();
+    if (v >= 0 && v < SENSOR_TYPE_COUNT) newSensor = (SensorType)v;
+  }
+  uint8_t newModbus = modbusAddress;
+  if (server.hasArg("modbusAddr")) {
+    int a = server.arg("modbusAddr").toInt();
+    if (a >= 1 && a <= 247) newModbus = a;
+  }
+  UartMode newUart = uartSetting;
+  if (server.hasArg("uartMode")) {
+    int u = server.arg("uartMode").toInt();
+    if (u >= UART_DETECT && u <= UART_CONTROLLED_9600) newUart = (UartMode)u;
+  }
+
   // === Connection Type === (applied after the WiFi settings below)
   LinkType newLink = linkType;
   if (server.hasArg("linkType")) {
@@ -1134,8 +1270,24 @@ void handleSaveAll() {
     saveUISettings();
   }
 
-  // A new connection type takes effect after a restart
-  if (newLink != linkType) {
+  // RS485 sensors sit on the LoRa pins
+  bool newIsRS485 = (newSensor == SENSOR_RS485_BRIDGE || newSensor == SENSOR_MODBUS);
+  if (newIsRS485 && newLink == TX_LINK_LONG_RANGE) {
+    server.sendHeader("Location", "/dashboard?error=2");
+    server.send(302, "text/plain", "");
+    return;
+  }
+
+  // A new sensor setup or connection type takes effect after a restart
+  bool sensorChanged = (newSensor != sensorType) || (newModbus != modbusAddress) || (newUart != uartSetting);
+  if (sensorChanged) {
+    if (newUart != uartSetting && newUart == UART_DETECT) saveUartDetected(UART_DETECT);  // Detect again
+    sensorType = newSensor;
+    modbusAddress = newModbus;
+    uartSetting = newUart;
+    saveSensorSettings();
+  }
+  if (newLink != linkType || sensorChanged) {
     linkType = newLink;
     saveLinkSettings();
     restartPending = true;
@@ -1570,13 +1722,82 @@ void resetEEPROM() {
   hasValidHistory = false;
 }
 
+// ============================================
+// SENSOR TYPE SETTINGS
+// ============================================
+
+void loadSensorSettings() {
+  uint8_t t = EEPROM.read(EEPROM_SENSOR_TYPE_ADDR);
+  sensorType = (t < SENSOR_TYPE_COUNT) ? (SensorType)t : SENSOR_TRIG_ECHO;
+  modbusAddress = EEPROM.read(EEPROM_MODBUS_ADDR);
+  if (modbusAddress < 1 || modbusAddress > 247) modbusAddress = 1;
+  uint8_t u = EEPROM.read(EEPROM_UART_SETTING_ADDR);
+  uartSetting = (u <= UART_CONTROLLED_9600) ? (UartMode)u : UART_DETECT;
+  uint8_t d = EEPROM.read(EEPROM_UART_DETECTED_ADDR);
+  uartActive = (uartSetting != UART_DETECT) ? uartSetting
+             : ((d >= UART_STREAM_9600 && d <= UART_CONTROLLED_9600) ? (UartMode)d : UART_DETECT);
+}
+
+void saveSensorSettings() {
+  EEPROM.write(EEPROM_SENSOR_TYPE_ADDR, (uint8_t)sensorType);
+  EEPROM.write(EEPROM_MODBUS_ADDR, modbusAddress);
+  EEPROM.write(EEPROM_UART_SETTING_ADDR, (uint8_t)uartSetting);
+  EEPROM.commit();
+}
+
+void saveUartDetected(UartMode m) {
+  EEPROM.write(EEPROM_UART_DETECTED_ADDR, (uint8_t)m);
+  EEPROM.commit();
+}
+
+bool sensorUsesRS485() {
+  return sensorType == SENSOR_RS485_BRIDGE || sensorType == SENSOR_MODBUS;
+}
+
+const char* sensorTypeName(SensorType t) {
+  switch (t) {
+    case SENSOR_UART: return "UART";
+    case SENSOR_RS485_BRIDGE: return "RS485 (UART bridge)";
+    case SENSOR_MODBUS: return "RS485 Modbus";
+    default: return "Standard (Trig/Echo)";
+  }
+}
+
+const char* uartModeName(UartMode m) {
+  switch (m) {
+    case UART_STREAM_9600: return "Auto-stream 9600";
+    case UART_STREAM_115200: return "Auto-stream 115200";
+    case UART_CONTROLLED_9600: return "Controlled 9600";
+    default: return "Not detected";
+  }
+}
+
+float sensorBlindZone() {
+  switch (sensorType) {
+    case SENSOR_UART:
+    case SENSOR_MODBUS: return 28.0;
+    case SENSOR_RS485_BRIDGE: return 30.0;
+    default: return 21.0;
+  }
+}
+
+float sensorMaxRange() {
+  switch (sensorType) {
+    case SENSOR_UART:
+    case SENSOR_MODBUS: return 750.0;
+    case SENSOR_RS485_BRIDGE: return 200.0;
+    default: return 450.0;
+  }
+}
+
+// Custom calibration applies to every sensor type; the built-in default
+// formula is an HC-SR04 correction, so serial sensors read raw without it.
 float applyCalibration(float rawReading) {
-  if (rawReading > 21 && rawReading <= 450) {
+  if (rawReading > sensorBlindZone() && rawReading <= sensorMaxRange()) {
     if (calibrationEnabled) {
-      // Use custom calibration values
       return calOffset + (calSlope * rawReading);
-    } else {
-      // Use default hardcoded calibration
+    }
+    if (sensorType == SENSOR_TRIG_ECHO) {
       return CAL_DEFAULT_OFFSET + (CAL_DEFAULT_SLOPE * rawReading);
     }
   }
@@ -1584,22 +1805,15 @@ float applyCalibration(float rawReading) {
 }
 
 TankZone getCurrentZone(float calibratedReading) {
-  if (calibratedReading >= UPPER_ZONE_MIN && calibratedReading <= UPPER_ZONE_MAX) {
-    return UPPER_ZONE;
-  }
-  else if (calibratedReading >= LOWER_ZONE_MIN) {
-    return LOWER_ZONE;
-  }
-  else if (calibratedReading >= MIDDLE_ZONE_MIN && calibratedReading <= MIDDLE_ZONE_MAX) {
-    return MIDDLE_ZONE;
-  }
-  return NO_ZONE;
+  if (calibratedReading <= sensorBlindZone() + ZONE_UPPER_MARGIN_CM) return UPPER_ZONE;
+  if (calibratedReading >= sensorMaxRange() * ZONE_LOWER_FRACTION) return LOWER_ZONE;
+  return MIDDLE_ZONE;
 }
 
 void updateZoneIfChanged(float calibratedReading) {
   TankZone currentZone = getCurrentZone(calibratedReading);
 
-  if (currentZone != lastStoredZone && currentZone != NO_ZONE) {
+  if (currentZone != lastStoredZone) {
     EEPROM.write(EEPROM_ZONE_ADDR, currentZone);
     EEPROM.write(EEPROM_VALID_FLAG_ADDR, EEPROM_MAGIC_NUMBER);
     EEPROM.commit();
@@ -1628,130 +1842,377 @@ void sortReadings(float arr[], int n) {
   }
 }
 
+// Median after rejecting outliers with the MAD filter (sorts in place)
+float madFilteredMedian(float* readings, int count) {
+  sortReadings(readings, count);
+  float median = (count % 2 == 1) ? readings[count / 2]
+                                  : (readings[count / 2 - 1] + readings[count / 2]) / 2.0;
+
+  float deviations[SAMPLE_COUNT];
+  for (int i = 0; i < count; i++) {
+    deviations[i] = fabs(readings[i] - median);
+  }
+  sortReadings(deviations, count);
+  float mad = (count % 2 == 1) ? deviations[count / 2]
+                               : (deviations[count / 2 - 1] + deviations[count / 2]) / 2.0;
+
+  float cleanReadings[SAMPLE_COUNT];
+  int cleanCount = 0;
+  float threshold = MAD_MULTIPLIER * mad;
+  if (threshold < 1.0) threshold = 15.0;  // All readings identical - use backup threshold
+  for (int i = 0; i < count; i++) {
+    if (fabs(readings[i] - median) <= threshold) {
+      cleanReadings[cleanCount++] = readings[i];
+    }
+  }
+
+  if (cleanCount >= max(2, count / 2)) {
+    sortReadings(cleanReadings, cleanCount);
+    median = (cleanCount % 2 == 1) ? cleanReadings[cleanCount / 2]
+                                   : (cleanReadings[cleanCount / 2 - 1] + cleanReadings[cleanCount / 2]) / 2.0;
+  }
+  return median;
+}
+
 // ============================================
-// ULTRASONIC SENSOR (MAD FILTERING)
+// ULTRASONIC SENSOR - STANDARD (TRIG/ECHO)
 // ============================================
 
-float readDistanceCM() {
+long readEchoDuration() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(5);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(15);
+  digitalWrite(TRIG_PIN, LOW);
+  return pulseIn(ECHO_PIN, HIGH, 60000);
+}
+
+// ============================================
+// ULTRASONIC SENSOR - SERIAL (UART / RS485)
+// ============================================
+
+void rememberRawFrame(const uint8_t* buf, uint8_t len) {
+  lastRawLen = min((int)len, (int)sizeof(lastRawFrame));
+  memcpy(lastRawFrame, buf, lastRawLen);
+}
+
+SampleResult classifyDistanceMm(uint16_t mm, float* cm) {
+  if (mm == 0xFFFE || mm == 0xFFFF || mm == 0) return SAMPLE_ANSWERED;
+  float d = mm / 10.0f;
+  if (d < sensorBlindZone() || d > sensorMaxRange()) return SAMPLE_ANSWERED;
+  *cm = d;
+  return SAMPLE_VALID;
+}
+
+// One DYP frame (0xFF HH LL SUM). Any byte counts as "answered".
+SampleResult readDypFrame(uint32_t timeoutMs, float* cm) {
+  bool gotBytes = false;
+  uint8_t frame[4];
+  uint8_t n = 0;
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    if (!sensorSerial.available()) {
+      delay(1);
+      continue;
+    }
+    uint8_t b = sensorSerial.read();
+    gotBytes = true;
+    if (n == 0 && b != 0xFF) continue;
+    frame[n++] = b;
+    if (n == 4) {
+      rememberRawFrame(frame, 4);
+      if (((frame[0] + frame[1] + frame[2]) & 0xFF) == frame[3]) {
+        return classifyDistanceMm((frame[1] << 8) | frame[2], cm);
+      }
+      n = 0;
+    }
+  }
+  return gotBytes ? SAMPLE_ANSWERED : SAMPLE_SILENT;
+}
+
+void rs485Send(const uint8_t* buf, size_t len) {
+  while (sensorSerial.available()) sensorSerial.read();
+  digitalWrite(RS485_DIR_PIN, HIGH);
+  delayMicroseconds(100);
+  sensorSerial.write(buf, len);
+  sensorSerial.flush();
+  delayMicroseconds(100);
+  digitalWrite(RS485_DIR_PIN, LOW);
+}
+
+// CRC-16/MODBUS: poly 0xA001, init 0xFFFF (01 03 01 00 00 01 -> 85 F6)
+uint16_t modbusCRC16(const uint8_t* buf, uint8_t len) {
+  uint16_t crc = 0xFFFF;
+  for (uint8_t i = 0; i < len; i++) {
+    crc ^= buf[i];
+    for (uint8_t b = 0; b < 8; b++) {
+      if (crc & 0x0001) {
+        crc >>= 1;
+        crc ^= 0xA001;
+      } else {
+        crc >>= 1;
+      }
+    }
+  }
+  return crc;
+}
+
+void buildModbusRequest(uint8_t* req) {
+  req[0] = modbusAddress;
+  req[1] = 0x03;
+  req[2] = MODBUS_REG_REALTIME >> 8;
+  req[3] = MODBUS_REG_REALTIME & 0xFF;
+  req[4] = 0x00;
+  req[5] = 0x01;
+  uint16_t crc = modbusCRC16(req, 6);
+  req[6] = crc & 0xFF;
+  req[7] = crc >> 8;
+}
+
+SampleResult readModbusSample(float* cm) {
+  uint8_t req[8];
+  buildModbusRequest(req);
+  rs485Send(req, 8);
+
+  uint8_t resp[7];
+  uint8_t n = 0;
+  unsigned long start = millis();
+  unsigned long lastByte = start;
+  while (n < 7 && millis() - start < 300) {
+    if (sensorSerial.available()) {
+      resp[n++] = sensorSerial.read();
+      lastByte = millis();
+      if (n == 5 && resp[1] == 0x83) break;  // Exception reply
+    } else if (n > 0 && millis() - lastByte > 30) {
+      break;
+    } else {
+      delay(1);
+    }
+  }
+  if (n > 0) rememberRawFrame(resp, n);
+  if (n == 0) return SAMPLE_SILENT;
+  if (n < 7 || resp[0] != modbusAddress || resp[1] != 0x03 || resp[2] != 0x02) return SAMPLE_ANSWERED;
+  if (modbusCRC16(resp, 5) != (uint16_t)(resp[5] | (resp[6] << 8))) return SAMPLE_ANSWERED;
+  return classifyDistanceMm((resp[3] << 8) | resp[4], cm);
+}
+
+SampleResult readBridgeSample(float* cm) {
+  uint8_t trig = RS485_BRIDGE_TRIGGER;
+  rs485Send(&trig, 1);
+  return readDypFrame(200, cm);
+}
+
+SampleResult readUartSample(float* cm) {
+  switch (uartActive) {
+    case UART_CONTROLLED_9600:
+      while (sensorSerial.available()) sensorSerial.read();
+      sensorSerial.write((uint8_t)RS485_BRIDGE_TRIGGER);  // Start bit = falling edge on sensor RX
+      sensorSerial.flush();
+      return readDypFrame(200, cm);
+    case UART_STREAM_9600:
+    case UART_STREAM_115200:
+      while (sensorSerial.available() > 8) sensorSerial.read();
+      return readDypFrame(150, cm);
+    default:
+      return SAMPLE_SILENT;
+  }
+}
+
+void beginSensorUart(uint32_t baud) {
+  sensorSerial.end();
+  sensorSerial.begin(baud, SERIAL_8N1, SENSOR_UART_RX_PIN, SENSOR_UART_TX_PIN);
+  delay(20);
+  while (sensorSerial.available()) sensorSerial.read();
+}
+
+// Auto-stream @115200, auto-stream @9600, controlled @9600 - first checksummed frame wins
+bool detectUartSensor() {
+  lastUartDetect = millis();
+  float cm;
+  const UartMode order[] = {UART_STREAM_115200, UART_STREAM_9600, UART_CONTROLLED_9600};
+  for (UartMode m : order) {
+    beginSensorUart(m == UART_STREAM_115200 ? 115200 : 9600);
+    uartActive = m;
+    lastRawLen = 0;
+    SampleResult r = (m == UART_CONTROLLED_9600) ? readUartSample(&cm) : readDypFrame(1200, &cm);
+    bool gotFrame = (r == SAMPLE_VALID) || (r == SAMPLE_ANSWERED && lastRawLen == 4 && lastRawFrame[0] == 0xFF &&
+                    ((lastRawFrame[0] + lastRawFrame[1] + lastRawFrame[2]) & 0xFF) == lastRawFrame[3]);
+    if (gotFrame) {
+      Serial.print(F("UART sensor detected: "));
+      Serial.println(uartModeName(m));
+      saveUartDetected(m);
+      return true;
+    }
+  }
+  uartActive = UART_DETECT;
+  Serial.println(F("UART sensor not detected - check TX 25 -> sensor RX, RX 34 <- sensor TX"));
+  return false;
+}
+
+void startSensor() {
+  switch (sensorType) {
+    case SENSOR_UART:
+      if (uartActive == UART_DETECT) {
+        detectUartSensor();
+      } else {
+        beginSensorUart(uartActive == UART_STREAM_115200 ? 115200 : 9600);
+      }
+      break;
+    case SENSOR_RS485_BRIDGE:
+    case SENSOR_MODBUS:
+      pinMode(RS485_DIR_PIN, OUTPUT);
+      digitalWrite(RS485_DIR_PIN, LOW);
+      sensorSerial.end();
+      sensorSerial.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+      break;
+    default:
+      pinMode(TRIG_PIN, OUTPUT);
+      pinMode(ECHO_PIN, INPUT);
+      digitalWrite(TRIG_PIN, LOW);
+      break;
+  }
+  Serial.print(F("Sensor: "));
+  Serial.println(sensorTypeName(sensorType));
+}
+
+SampleResult readSerialSample(float* cm) {
+  switch (sensorType) {
+    case SENSOR_UART: return readUartSample(cm);
+    case SENSOR_RS485_BRIDGE: return readBridgeSample(cm);
+    case SENSOR_MODBUS: return readModbusSample(cm);
+    default: return SAMPLE_SILENT;
+  }
+}
+
+// ============================================
+// ONE READING (any sensor type)
+// ============================================
+
+// MAD-filtered, calibrated distance in cm, or -1. *answered tells a sensor
+// that responded but could not measure apart from a silent one.
+float readDistanceCM(bool* answered) {
   float readings[SAMPLE_COUNT];
   int count = 0;
+  bool anyAnswer = false;
 
-  #if DEBUG_MODE
-  Serial.print(F("MAD: "));
-  #endif
-
-  for (int i = 0; i < SAMPLE_COUNT; i++) {
-    digitalWrite(TRIG_PIN, LOW);
-    delayMicroseconds(5);
-    digitalWrite(TRIG_PIN, HIGH);
-    delayMicroseconds(15);
-    digitalWrite(TRIG_PIN, LOW);
-
-    long duration = pulseIn(ECHO_PIN, HIGH, 60000);
-    float distance = duration * 0.0343 / 2;
-
-    if (duration > 0 && distance > 21 && distance <= 450) {
-      readings[count++] = distance;
-      #if DEBUG_MODE
-      Serial.print(distance, 0);
-      Serial.print(F(" "));
-      #endif
-    } else {
-      #if DEBUG_MODE
-      Serial.print(F("X "));
-      #endif
-    }
-
-    delay(READING_DELAY);
-  }
-  #if DEBUG_MODE
-  Serial.println();
-  #endif
-
-  if (count >= MIN_VALID_SAMPLES) {
-    sortReadings(readings, count);
-
-    float median;
-    if (count % 2 == 1) {
-      median = readings[count / 2];
-    } else {
-      median = (readings[count / 2 - 1] + readings[count / 2]) / 2.0;
-    }
-
-    float deviations[SAMPLE_COUNT];
-    for (int i = 0; i < count; i++) {
-      deviations[i] = abs(readings[i] - median);
-    }
-    sortReadings(deviations, count);
-
-    float mad;
-    if (count % 2 == 1) {
-      mad = deviations[count / 2];
-    } else {
-      mad = (deviations[count / 2 - 1] + deviations[count / 2]) / 2.0;
-    }
-
-    float cleanReadings[SAMPLE_COUNT];
-    int cleanCount = 0;
-    float threshold = MAD_MULTIPLIER * mad;
-
-    for (int i = 0; i < count; i++) {
-      if (abs(readings[i] - median) <= threshold) {
-        cleanReadings[cleanCount++] = readings[i];
+  if (sensorType == SENSOR_TRIG_ECHO) {
+    for (int i = 0; i < SAMPLE_COUNT; i++) {
+      long duration = readEchoDuration();
+      float distance = duration * 0.0343 / 2;
+      if (duration > 0) anyAnswer = true;
+      if (duration > 0 && distance > sensorBlindZone() && distance <= sensorMaxRange()) {
+        readings[count++] = distance;
       }
-    }
-
-    if (cleanCount >= (MIN_VALID_SAMPLES / 2)) {
-      sortReadings(cleanReadings, cleanCount);
-
-      if (cleanCount % 2 == 1) {
-        median = cleanReadings[cleanCount / 2];
-      } else {
-        median = (cleanReadings[cleanCount / 2 - 1] + cleanReadings[cleanCount / 2]) / 2.0;
-      }
-    }
-
-    #if DEBUG_MODE
-    Serial.print(F("Valid: "));
-    Serial.print(count);
-    Serial.print(F(" Clean: "));
-    Serial.print(cleanCount);
-    Serial.print(F(" Final: "));
-    Serial.print(median, 1);
-    Serial.println(F("cm"));
-    #endif
-
-    if (median > 21 && median <= 450) {
-      lastRawReading = median;  // Store raw value before calibration
-      float calibratedValue = applyCalibration(median);
-      updateZoneIfChanged(calibratedValue);
-      return calibratedValue;
+      if (i + 1 == 3 && !anyAnswer) break;  // Nothing connected - don't block ~1.6s
+      delay(READING_DELAY);
     }
   } else {
+    if (sensorType == SENSOR_UART && uartActive == UART_DETECT && millis() - lastUartDetect > 300000UL) {
+      detectUartSensor();  // Retry every 5 minutes while nothing is found
+    }
+    for (int i = 0; i < SERIAL_SAMPLES; i++) {
+      float cm = -1;
+      SampleResult r = readSerialSample(&cm);
+      if (r != SAMPLE_SILENT) anyAnswer = true;
+      if (r == SAMPLE_VALID) readings[count++] = cm;
+      if (i + 1 == 3 && !anyAnswer) break;
+      delay(160);  // DYP needs > 150 ms between triggers
+    }
+  }
+
+  if (answered) *answered = anyAnswer;
+
+  int needed = (sensorType == SENSOR_TRIG_ECHO) ? MIN_VALID_SAMPLES : SERIAL_MIN_VALID;
+  if (count < needed) {
     #if DEBUG_MODE
-    Serial.print(F("Only "));
-    Serial.print(count);
-    Serial.println(F(" valid samples"));
+    Serial.printf("Read failed: %d valid, answered=%d\n", count, anyAnswer);
     #endif
+    return -1.0;
   }
 
-  // Zone-based boundary logic
-  if (hasValidHistory) {
-    if (lastStoredZone == UPPER_ZONE) {
-      #if DEBUG_MODE
-      Serial.println(F("Zone: UPPER->21cm"));
-      #endif
-      return applyCalibration(21.0);
+  float median = madFilteredMedian(readings, count);
+  lastRawReading = median;  // Raw value before calibration (setup page)
+  return applyCalibration(median);
+}
+
+// Diagnostics: SENSOR RAW
+void sensorRawDump() {
+  Serial.printf("\n--- SENSOR RAW: %s ---\n", sensorTypeName(sensorType));
+  if (sensorType == SENSOR_TRIG_ECHO) {
+    for (int i = 0; i < 5; i++) {
+      long d = readEchoDuration();
+      Serial.printf("Pulse %d: %ld us = %.1f cm\n", i + 1, d, d * 0.0343 / 2);
+      delay(READING_DELAY);
     }
-    else if (lastStoredZone == LOWER_ZONE) {
-      #if DEBUG_MODE
-      Serial.println(F("Zone: LOWER->400cm"));
-      #endif
-      return 400.0;
+    return;
+  }
+  while (sensorSerial.available()) sensorSerial.read();
+  if (sensorType == SENSOR_MODBUS) {
+    uint8_t req[8];
+    buildModbusRequest(req);
+    Serial.print(F("TX: "));
+    for (int i = 0; i < 8; i++) Serial.printf("%02X ", req[i]);
+    Serial.println();
+    rs485Send(req, 8);
+  } else if (sensorType == SENSOR_RS485_BRIDGE) {
+    uint8_t trig = RS485_BRIDGE_TRIGGER;
+    Serial.println(F("TX: 55"));
+    rs485Send(&trig, 1);
+  } else if (uartActive == UART_CONTROLLED_9600) {
+    Serial.println(F("TX: 55"));
+    sensorSerial.write((uint8_t)RS485_BRIDGE_TRIGGER);
+    sensorSerial.flush();
+  } else {
+    Serial.printf("Listening (%s)\n", uartModeName(uartActive));
+  }
+  Serial.print(F("RX: "));
+  int n = 0;
+  unsigned long start = millis();
+  while (millis() - start < 1500 && n < 64) {
+    if (sensorSerial.available()) {
+      Serial.printf("%02X ", sensorSerial.read());
+      n++;
     }
   }
+  Serial.printf(n ? "(%d bytes)\n" : "(nothing - 0 bytes)\n", n);
+}
 
-  return -1.0;
+// Diagnostics: SENSOR TEST
+void sensorTest() {
+  Serial.printf("\n--- SENSOR TEST: %s ---\n", sensorTypeName(sensorType));
+  bool answered = false;
+  float d = readDistanceCM(&answered);
+  if (d > 0) {
+    Serial.printf("Distance: %.1f cm (raw %.1f)\n", d, lastRawReading);
+  } else if (answered) {
+    Serial.printf("Sensor answered but no valid distance (range %.0f-%.0f cm)\n", sensorBlindZone(), sensorMaxRange());
+  } else {
+    Serial.println(F("No reply - check wiring, power and settings"));
+  }
+  if (lastRawLen) {
+    Serial.print(F("Last frame: "));
+    for (int i = 0; i < lastRawLen; i++) Serial.printf("%02X ", lastRawFrame[i]);
+    Serial.println();
+  }
+}
+
+void handleSerialCommands() {
+  if (!Serial.available()) return;
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  cmd.toUpperCase();
+  if (cmd == "SENSOR RAW") {
+    sensorRawDump();
+  } else if (cmd == "SENSOR TEST") {
+    sensorTest();
+  } else if (cmd == "SENSOR") {
+    Serial.printf("Sensor: %s | range %.0f-%.0f cm | ID %s\n", sensorTypeName(sensorType), sensorBlindZone(), sensorMaxRange(), deviceID);
+    if (sensorType == SENSOR_UART) Serial.printf("UART: %s\n", uartModeName(uartActive));
+    if (sensorType == SENSOR_MODBUS) Serial.printf("Modbus: address %u, register 0x%04X, %d baud\n", modbusAddress, MODBUS_REG_REALTIME, RS485_BAUD);
+    Serial.printf("Connection: %s\n", getLinkStatusString().c_str());
+  } else if (cmd.length() > 0) {
+    Serial.println(F("Commands: SENSOR, SENSOR RAW, SENSOR TEST"));
+  }
 }
 
 // ============================================
@@ -1952,10 +2413,32 @@ void measurementCycle() {
   Serial.println(F("\n--- TX Cycle ---"));
   #endif
 
-  float calibratedDistance = readDistanceCM();
+  bool answered = false;
+  float calibratedDistance = readDistanceCM(&answered);
   bool hasDistance = calibratedDistance > 0;
+  bool estimate = false;
+  uint8_t heartbeat = 0;
+
   if (hasDistance) {
+    silentCycles = 0;
     lastReading = calibratedDistance;
+    updateZoneIfChanged(calibratedDistance);
+  } else if (answered) {
+    // Sensor answers but can't measure: use the zone it was last in
+    silentCycles = 0;
+    if (hasValidHistory && lastStoredZone == UPPER_ZONE) {
+      calibratedDistance = applyCalibration(sensorBlindZone() + 0.5);  // Water at the sensor - Full
+      hasDistance = estimate = true;
+    } else if (hasValidHistory && lastStoredZone == LOWER_ZONE) {
+      calibratedDistance = sensorMaxRange();                           // Past the floor - Empty
+      hasDistance = estimate = true;
+    } else {
+      heartbeat = 1;
+    }
+  } else {
+    // Nothing answered at all - after a few cycles tell the display to check the sensor
+    if (silentCycles < 255) silentCycles++;
+    heartbeat = (silentCycles >= SILENT_CYCLES_BEFORE_ALERT) ? 2 : 1;
   }
 
   PACKET_COUNTER++;
@@ -1965,14 +2448,17 @@ void measurementCycle() {
   }
 
   lastSentHasDistance = hasDistance;
+  lastSentEstimate = estimate;
+  lastSentHeartbeat = heartbeat;
   lastSentDistance = hasDistance ? (int)(calibratedDistance + 0.5) : 0;
 
   if (hasDistance) {
-    snprintf(txPayload, sizeof(txPayload), "{\"i\":\"%s\",\"s\":%lu,\"c\":%lu,\"d\":%d}",
+    snprintf(txPayload, sizeof(txPayload), estimate ? "{\"i\":\"%s\",\"s\":%lu,\"c\":%lu,\"d\":%d,\"e\":1}"
+                                                    : "{\"i\":\"%s\",\"s\":%lu,\"c\":%lu,\"d\":%d}",
              deviceID, SESSION_ID, PACKET_COUNTER, lastSentDistance);
   } else {
-    snprintf(txPayload, sizeof(txPayload), "{\"i\":\"%s\",\"s\":%lu,\"c\":%lu,\"h\":1}",
-             deviceID, SESSION_ID, PACKET_COUNTER);
+    snprintf(txPayload, sizeof(txPayload), "{\"i\":\"%s\",\"s\":%lu,\"c\":%lu,\"h\":%u}",
+             deviceID, SESSION_ID, PACKET_COUNTER, heartbeat);
   }
 
   #if DEBUG_MODE
@@ -2002,11 +2488,11 @@ void handleReading() {
     // No reading taken yet since boot
     snprintf(buf, sizeof(buf), "{\"i\":\"%s\",\"s\":%lu,\"c\":0,\"h\":1,\"r\":%ld}", deviceID, SESSION_ID, rssi);
   } else if (lastSentHasDistance) {
-    snprintf(buf, sizeof(buf), "{\"i\":\"%s\",\"s\":%lu,\"c\":%lu,\"d\":%d,\"r\":%ld}",
-             deviceID, SESSION_ID, PACKET_COUNTER, lastSentDistance, rssi);
+    snprintf(buf, sizeof(buf), "{\"i\":\"%s\",\"s\":%lu,\"c\":%lu,\"d\":%d,%s\"r\":%ld}",
+             deviceID, SESSION_ID, PACKET_COUNTER, lastSentDistance, lastSentEstimate ? "\"e\":1," : "", rssi);
   } else {
-    snprintf(buf, sizeof(buf), "{\"i\":\"%s\",\"s\":%lu,\"c\":%lu,\"h\":1,\"r\":%ld}",
-             deviceID, SESSION_ID, PACKET_COUNTER, rssi);
+    snprintf(buf, sizeof(buf), "{\"i\":\"%s\",\"s\":%lu,\"c\":%lu,\"h\":%u,\"r\":%ld}",
+             deviceID, SESSION_ID, PACKET_COUNTER, lastSentHeartbeat ? lastSentHeartbeat : 1, rssi);
   }
   server.send(200, "application/json", buf);
 }

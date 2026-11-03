@@ -290,6 +290,8 @@ struct SensorData {
   uint32_t packets;
   uint32_t duplicates;
   uint32_t heartbeats;
+  bool sensorSilent;           // Wireless: transmitter reports its sensor is not responding
+  unsigned long silentSince;   // When that started (drives the "not responding" alarm)
 };
 
 // History record (12 bytes) - one slot per sequence number in a circular LittleFS file
@@ -308,6 +310,8 @@ struct SensorMsg {
   bool hasDistance;
   float distance;
   int rssi;
+  bool estimate;      // "e":1 - zone estimate (Full / Empty) from the sensor
+  bool sensorSilent;  // "h":2 - transmitter alive, its ultrasonic sensor not responding
 };
 
 // Scan results (sensor discovery)
@@ -2207,18 +2211,36 @@ LinkState getLinkState() {
   if (linkType != LINK_WIRED && (millis() - tankData.lastUpdate) > WIRELESS_SILENT_MS) {
     return LS_OFFLINE;
   }
+  if (linkType != LINK_WIRED && tankData.sensorSilent && tankData.lastWasHeartbeat) {
+    return LS_OFFLINE;  // Transmitter alive but its sensor is silent - CHECK SENSOR
+  }
   return tankData.lastWasHeartbeat ? LS_HEARTBEAT : LS_LIVE;
 }
 
 // Customer wording for a silent sensor - never "offline"
 const char* silentText() {
-  return (linkType == LINK_WIRED) ? "CHECK SENSOR" : "NO SIGNAL";
+  return (linkType == LINK_WIRED || sensorIsSilent()) ? "CHECK SENSOR" : "NO SIGNAL";
+}
+
+// How long the sensor has given no reading: silent link, or a transmitter reporting "h":2
+unsigned long sensorQuietMs() {
+  unsigned long quiet = millis() - tankData.lastUpdate;
+  if (linkType != LINK_WIRED && tankData.sensorSilent) {
+    quiet = max(quiet, millis() - tankData.silentSince);
+  }
+  return quiet;
+}
+
+// Sensor itself is not responding (wired, or a live transmitter reporting "h":2)
+bool sensorIsSilent() {
+  if (linkType == LINK_WIRED) return true;
+  return tankData.sensorSilent && (millis() - tankData.lastUpdate) <= WIRELESS_SILENT_MS;
 }
 
 // Zone estimate label while in heartbeat: "Full" / "Empty" / ""
 const char* zoneEstimateText() {
   if (!zoneEstimate) return "";
-  return (lastZone == ZONE_UPPER) ? "Full" : ((lastZone == ZONE_LOWER) ? "Empty" : "");
+  return (tankData.currentPercent >= 50) ? "Full" : "Empty";
 }
 
 const char* linkStateKey(LinkState s) {
@@ -2266,7 +2288,9 @@ bool parseSensorPayload(const char* json, size_t len, SensorMsg* msg) {
     if (!hb && doc.containsKey("d")) {
       msg->distance = doc["d"].as<float>();
       msg->hasDistance = msg->distance > 0;
+      msg->estimate = (doc["e"] | 0) == 1;
     }
+    msg->sensorSilent = (hb == 2);
     msg->rssi = doc["r"] | 0;  // Home Network: sensor's own WiFi signal
   } else if (doc.containsKey("node_id")) {
     // Older transmitter firmware: {"node_id":"US3847","msg_id":"US3847_<session>_<counter>","data":"143"}
@@ -2356,7 +2380,17 @@ bool handleSensorMessage(const SensorMsg& msg, uint8_t via) {
   tankData.lastCounter = msg.counter;
   tankData.packets++;
 
-  if (msg.hasDistance) {
+  if (msg.sensorSilent && !tankData.sensorSilent) {
+    tankData.silentSince = millis();
+  }
+  tankData.sensorSilent = msg.sensorSilent;
+
+  if (msg.hasDistance && msg.estimate) {
+    // Sensor answers but is blind/past the floor - Full or Empty estimate, shown as heartbeat
+    tankData.lastWasHeartbeat = true;
+    tankData.heartbeats++;
+    processWaterLevelData(msg.distance, true);
+  } else if (msg.hasDistance) {
     tankData.lastWasHeartbeat = false;
     processWaterLevelData(msg.distance);
     #if DEBUG_MODE
@@ -2842,7 +2876,7 @@ bool checkAlarmConditions() {
 
   if (tankConfig.enabled && tankData.hasData) {
     unsigned long offlineThreshold = generalSettings.offlineTimeoutMinutes * 60000UL;
-    if ((millis() - tankData.lastUpdate) > offlineThreshold) {
+    if (sensorQuietMs() > offlineThreshold) {
       tankData.isOnline = false;
 
       if (!alarmAck.tankOfflineAck) {
@@ -3335,7 +3369,7 @@ void showTankScreen() {
   u8g2.drawStr(16, 8, tankConfig.customName);
   const char* tag = "";
   if (state == LS_HEARTBEAT) tag = "[HB]";
-  else if (state == LS_OFFLINE) tag = (linkType == LINK_WIRED) ? "CHECK" : "NO SIG";
+  else if (state == LS_OFFLINE) tag = sensorIsSilent() ? "CHECK" : "NO SIG";
   else if (state == LS_WAITING) tag = "WAIT";
   u8g2.drawStr(70, 8, tag);
   drawHeart(114, 0, alive);
@@ -3344,7 +3378,7 @@ void showTankScreen() {
     u8g2.setFont(u8g2_font_6x10_tr);
     if (state == LS_OFFLINE) {
       u8g2.drawStr(16, 32, silentText());
-      u8g2.drawStr(16, 44, linkType == LINK_WIRED ? "Not responding" : "From sensor");
+      u8g2.drawStr(16, 44, sensorIsSilent() ? "Not responding" : "From sensor");
     } else {
       u8g2.drawStr(16, 32, "Waiting for");
       u8g2.drawStr(16, 44, "sensor data...");
@@ -3380,7 +3414,7 @@ void showTankScreen() {
   u8g2.setFont(u8g2_font_5x7_tr);
   if (state == LS_HEARTBEAT && zoneEstimate) {
     // Zone estimate: sensor answers but can't measure at the very top/bottom of the tank
-    u8g2.drawStr(16, 64, lastZone == ZONE_UPPER ? "Full - sensor blind" : "Empty - beyond range");
+    u8g2.drawStr(16, 64, tankData.currentPercent >= 50 ? "Full - sensor blind" : "Empty - beyond range");
   } else if (state == LS_OFFLINE || state == LS_HEARTBEAT) {
     String ago;
     if (state == LS_OFFLINE) {
@@ -3915,7 +3949,7 @@ void handleAPIStatus() {
       tankConfig.customName[8] = '\0'; // Ensure null termination
       alarm["type"] = "Sensor Not Responding";
       alarm["sensor"] = String(tankConfig.customName);
-      alarm["message"] = (linkType == LINK_WIRED) ? "Check the sensor and its cable (no response)"
+      alarm["message"] = sensorIsSilent() ? "Check the sensor and its cable (no response)"
                                                   : "No signal from the sensor - check its power and range";
     }
   }
@@ -3954,6 +3988,7 @@ void handleAPIStatus() {
     link["via"] = (via == VIA_NONE) ? linkTypeName(linkType) : linkViaName(via);
     link["sensor"] = (linkType == LINK_WIRED) ? String(wiredTypeName(wiredType)) : String(tankConfig.nodeID);
     link["wired"] = (linkType == LINK_WIRED);
+    link["sensorSilent"] = sensorIsSilent();
     link["rssi"] = tankData.rssi;
     link["bars"] = signalBars();
   }
@@ -4266,7 +4301,7 @@ if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';return Math.f
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 const STATE_TEXT={live:'Live',heartbeat:'Sensor alive - showing last reading',waiting:'Waiting for sensor'};
 function stateText(st,link,tank){
-if(st==='offline')return link.wired?'Check sensor - not responding (showing last reading)':'No signal from sensor (showing last reading)';
+if(st==='offline')return (link.wired||link.sensorSilent)?'Check sensor - not responding (showing last reading)':'No signal from sensor (showing last reading)';
 if(st==='heartbeat'&&tank.estimate)return 'Sensor alive - tank '+(tank.estimate==='Full'?'full (sensor blind)':'empty (beyond range)');
 return STATE_TEXT[st];}
 function bars(n){let h='<span class="bars">';for(let i=0;i<3;i++){h+='<i class="'+(i<n?'on':'')+'" style="height:'+(4+i*4)+'px"></i>';}return h+'</span>';}
@@ -5210,12 +5245,11 @@ void loop() {
 }
 
 void checkSensorOnlineStatus() {
-  unsigned long currentTime = millis();
   unsigned long offlineThreshold = generalSettings.offlineTimeoutMinutes * 60000UL;
 
   if (tankConfig.enabled && tankData.hasData) {
     bool wasOnline = tankData.isOnline;
-    tankData.isOnline = (currentTime - tankData.lastUpdate) <= offlineThreshold;
+    tankData.isOnline = sensorQuietMs() <= offlineThreshold;
 
     if (wasOnline && !tankData.isOnline) {
       Serial.print("Tank (");
