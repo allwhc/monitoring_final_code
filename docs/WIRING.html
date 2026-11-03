@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SenseFlow Wiring Guide</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+/* Layout: one reading column like a datasheet - pin tables, then one block per wiring setup, then the compatibility matrix */
+:root {
+  --bg: #f6f7f4;
+  --paper: #ffffff;
+  --ink: #1d2420;
+  --muted: #59625c;
+  --rule: #d9ded8;
+  --accent: #0c6b4e;          /* solder-mask green */
+  --accent-soft: #e3f1eb;
+  --ok: #17703f;  --ok-bg: #e4f3e9;
+  --no: #b3261e;  --no-bg: #fbe8e6;
+  --warn: #8a5a00; --warn-bg: #fdf1d8;
+  --pin-bg: #232a26; --pin-fg: #f3d77a;   /* gold pin on a black header */
+  --w-red: #c62828; --w-black: #222; --w-yellow: #e0a800; --w-blue: #1f5fbf; --w-green: #2e7d32; --w-white: #f2f2f2; --w-orange: #e8711b; --w-purple: #7b3fa8; --w-brown: #7a4b26; --w-grey: #8a8f8c;
+  --display: "Barlow Semi Condensed", "Arial Narrow", Arial, sans-serif;
+  --body: "Barlow", "Segoe UI", Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121614; --paper: #1a201d; --ink: #e6ebe7; --muted: #a3ada6; --rule: #2e3732;
+    --accent: #4cc497; --accent-soft: #1d3029;
+    --ok: #6fd39a; --ok-bg: #173324; --no: #ff8f86; --no-bg: #3a1b19; --warn: #f0c35a; --warn-bg: #352a12;
+    --pin-bg: #0b0e0c; --pin-fg: #f3d77a; --w-black: #9aa09c;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #121614; --paper: #1a201d; --ink: #e6ebe7; --muted: #a3ada6; --rule: #2e3732;
+  --accent: #4cc497; --accent-soft: #1d3029;
+  --ok: #6fd39a; --ok-bg: #173324; --no: #ff8f86; --no-bg: #3a1b19; --warn: #f0c35a; --warn-bg: #352a12;
+  --pin-bg: #0b0e0c; --pin-fg: #f3d77a; --w-black: #9aa09c;
+  color-scheme: dark;
+}
+
+body { margin: 0; background: var(--bg); color: var(--ink); font: 400 16px/1.55 var(--body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 28px 64px; }
+.wrap { max-width: 980px; margin: 0 auto; display: grid; gap: 28px; }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; line-height: 1.15; }
+h1 { font-size: clamp(2rem, 5vw, 2.8rem); font-weight: 700; letter-spacing: -0.01em; }
+h2 { font-size: 1.55rem; font-weight: 700; }
+h3 { font-size: 1.2rem; font-weight: 600; }
+p { margin: 0; max-width: 68ch; }
+code, .mono { font-family: var(--mono); font-size: 0.9em; }
+.eyebrow { font: 600 0.78rem/1 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); }
+.muted { color: var(--muted); }
+
+header.top { display: grid; gap: 10px; padding-bottom: 18px; border-bottom: 2px solid var(--ink); }
+.meta { display: flex; flex-wrap: wrap; gap: 8px 20px; font: 500 0.85rem/1.4 var(--mono); color: var(--muted); }
+
+section { display: grid; gap: 14px; min-width: 0; }
+.sheet { background: var(--paper); border: 1px solid var(--rule); border-radius: 6px; padding: 20px; display: grid; gap: 14px; min-width: 0; }
+
+/* Safety rules */
+.rules { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 12px; }
+.rule { background: var(--paper); border: 1px solid var(--rule); border-left: 4px solid var(--no); border-radius: 4px; padding: 14px 16px; display: grid; gap: 6px; }
+.rule.warn { border-left-color: var(--warn); }
+.rule strong { font-family: var(--display); font-size: 1.08rem; font-weight: 600; }
+.rule p { font-size: 0.95rem; color: var(--muted); }
+
+/* Tables */
+.tbl { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 0.94rem; min-width: 620px; }
+th, td { text-align: left; vertical-align: top; padding: 9px 10px; border-bottom: 1px solid var(--rule); }
+th { font: 600 0.76rem/1.2 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); border-bottom: 2px solid var(--ink); }
+tbody tr:last-child td { border-bottom: none; }
+td.when { color: var(--muted); font-size: 0.9rem; }
+
+.pin { display: inline-block; font: 600 0.82rem/1 var(--mono); background: var(--pin-bg); color: var(--pin-fg); padding: 5px 7px 4px; border-radius: 3px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pin.pwr { background: var(--w-red); color: #fff; }
+.pin.gnd { background: var(--w-black); color: #fff; }
+.wire { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.wire i { width: 22px; height: 6px; border-radius: 3px; display: inline-block; border: 1px solid rgba(0,0,0,0.25); }
+
+/* Status chips: always text + color */
+.chip { display: inline-block; font: 600 0.78rem/1 var(--mono); padding: 4px 7px; border-radius: 3px; white-space: nowrap; }
+.chip.ok { background: var(--ok-bg); color: var(--ok); }
+.chip.no { background: var(--no-bg); color: var(--no); }
+.chip.warn { background: var(--warn-bg); color: var(--warn); }
+.chip.na { background: transparent; color: var(--muted); border: 1px dashed var(--rule); }
+
+/* Setup blocks */
+.setups { display: grid; gap: 18px; }
+.setup { background: var(--paper); border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; display: grid; min-width: 0; }
+.setup > .head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 16px; padding: 14px 20px; background: var(--accent-soft); border-bottom: 1px solid var(--rule); }
+.setup > .head .tag { font: 600 0.78rem/1 var(--mono); color: var(--accent); letter-spacing: 0.06em; }
+.setup > .body { padding: 16px 20px 20px; display: grid; gap: 14px; min-width: 0; }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+.two > * { min-width: 0; }
+.note { font-size: 0.92rem; padding: 10px 12px; border-radius: 4px; background: var(--warn-bg); color: var(--ink); }
+.note b { color: var(--warn); }
+.note.bad { background: var(--no-bg); }
+.note.bad b { color: var(--no); }
+ul.tight { margin: 0; padding-left: 1.2em; display: grid; gap: 4px; }
+
+/* Wiring diagram (inline SVG) */
+.diagram { overflow-x: auto; }
+.diagram svg { display: block; min-width: 560px; max-width: 100%; height: auto; }
+.diagram text { font-family: var(--mono); font-size: 12px; fill: var(--ink); }
+.diagram .lbl { fill: var(--muted); font-size: 11px; }
+.diagram .box { fill: var(--paper); stroke: var(--ink); stroke-width: 1.5; }
+.diagram .boxhead { fill: var(--ink); font-family: var(--display); font-size: 14px; font-weight: 600; }
+
+.matrix td, .matrix th { text-align: center; }
+.matrix td:first-child, .matrix th:first-child { text-align: left; }
+
+.steps { counter-reset: s; display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.steps li { counter-increment: s; display: grid; grid-template-columns: 30px 1fr; gap: 10px; align-items: start; }
+.steps li::before { content: counter(s); font: 600 0.85rem/26px var(--mono); text-align: center; width: 26px; height: 26px; border-radius: 50%; background: var(--ink); color: var(--paper); }
+
+footer { font-size: 0.85rem; color: var(--muted); border-top: 1px solid var(--rule); padding-top: 14px; }
+a { color: var(--accent); }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+<header class="top">
+  <span class="eyebrow">Installer reference</span>
+  <h1>SenseFlow Wiring Guide</h1>
+  <p>Which ESP32 pin goes where on the tank display (Monitor) and the tank sensor (Transmitter), for every sensor type and connection type, and which combinations must never be wired together.</p>
+  <div class="meta"><span>Monitor firmware 56.1.0</span><span>Transmitter firmware 55.1.0</span><span>Board: ESP32-WROOM-32</span></div>
+</header>
+
+<!-- 1. Rules -->
+<section aria-labelledby="rules-h">
+  <h2 id="rules-h">Read before wiring</h2>
+  <div class="rules">
+    <div class="rule"><strong>ESP32 pins are 3.3 V only</strong><p>Never put 5 V on a GPIO. A 5 V sensor's ECHO or TX output must go through a voltage divider before GPIO34 (see each setup below).</p></div>
+    <div class="rule"><strong>One sensor type per board</strong><p>GPIO25 and GPIO34 are shared by Trig/Echo, UART and RS485. Wire only the sensor type selected in Settings. Never leave a second sensor connected.</p></div>
+    <div class="rule"><strong>RS485 boards have no Long Range module</strong><p>The RS485 module's RO output uses GPIO5, which is also the LoRa chip select. Remove the LoRa module from any board wired for RS485 (UART bridge or Modbus).</p></div>
+    <div class="rule"><strong>Use an ESP32-WROOM-32</strong><p>RS485 TX is on GPIO17. On ESP32-WROVER modules GPIO16/17 are used by PSRAM and RS485 will not work.</p></div>
+    <div class="rule warn"><strong>Antenna before power</strong><p>Fit the 433 MHz antenna before powering a Long Range module. Transmitting without one can damage it. LoRa modules are 3.3 V only.</p></div>
+    <div class="rule warn"><strong>Keep these pins free</strong><p>GPIO6 to GPIO11 (internal flash). Avoid GPIO0, GPIO2, GPIO12 and GPIO15 (boot strapping) for anything else you add.</p></div>
+  </div>
+</section>
+
+<!-- 2. Pin maps -->
+<section aria-labelledby="pins-h">
+  <h2 id="pins-h">Pin map</h2>
+  <div class="sheet">
+    <h3>Monitor (tank display)</h3>
+    <div class="tbl"><table>
+      <thead><tr><th>GPIO</th><th>Function</th><th>Connect to</th><th>Connected when</th></tr></thead>
+      <tbody>
+        <tr><td><span class="pin">21</span></td><td>I2C SDA</td><td>OLED SDA (SH1106 1.3", address 0x3C or 0x3D, found automatically)</td><td class="when">Always if a display is fitted. The monitor works without it.</td></tr>
+        <tr><td><span class="pin">22</span></td><td>I2C SCL</td><td>OLED SCL</td><td class="when">Always if a display is fitted</td></tr>
+        <tr><td><span class="pin">4</span></td><td>Buzzer</td><td>Active buzzer + (drive through an NPN transistor if it draws more than 20 mA)</td><td class="when">Always</td></tr>
+        <tr><td><span class="pin">33</span></td><td>Button</td><td>Push button to GND (internal pull-up, no resistor needed)</td><td class="when">Always</td></tr>
+        <tr><td><span class="pin">25</span></td><td>Sensor line A</td><td>TRIG <em>or</em> UART TX → sensor RX <em>or</em> RS485 DE+RE</td><td class="when">Wired connection only. Meaning depends on Wired sensor type.</td></tr>
+        <tr><td><span class="pin">34</span></td><td>Sensor line B (input only)</td><td>ECHO <em>or</em> UART RX ← sensor TX</td><td class="when">Wired: Trig/Echo or UART. Not used with RS485.</td></tr>
+        <tr><td><span class="pin">5</span></td><td>LoRa NSS <em>or</em> RS485 RO</td><td>LoRa NSS, <em>or</em> MAX485 RO</td><td class="when">LoRa: wireless Long Range / Auto. RS485: wired RS485 types. Never both.</td></tr>
+        <tr><td><span class="pin">17</span></td><td>RS485 DI</td><td>MAX485 DI</td><td class="when">Wired RS485 types only</td></tr>
+        <tr><td><span class="pin">18</span> <span class="pin">19</span> <span class="pin">23</span></td><td>SPI SCK / MISO / MOSI</td><td>LoRa SCK / MISO / MOSI</td><td class="when">Long Range module fitted</td></tr>
+        <tr><td><span class="pin">14</span></td><td>LoRa RST</td><td>LoRa RST</td><td class="when">Long Range module fitted</td></tr>
+        <tr><td><span class="pin">26</span></td><td>LoRa DIO0</td><td>LoRa DIO0</td><td class="when">Long Range module fitted</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+
+  <div class="sheet">
+    <h3>Transmitter (tank sensor)</h3>
+    <p class="muted">Same sensor and LoRa pins as the monitor. No display, buzzer or button.</p>
+    <div class="tbl"><table>
+      <thead><tr><th>GPIO</th><th>Function</th><th>Connect to</th><th>Connected when</th></tr></thead>
+      <tbody>
+        <tr><td><span class="pin">25</span></td><td>Sensor line A</td><td>TRIG <em>or</em> UART TX → sensor RX <em>or</em> RS485 DE+RE</td><td class="when">Always. Meaning depends on Sensor Type on the setup page.</td></tr>
+        <tr><td><span class="pin">34</span></td><td>Sensor line B (input only)</td><td>ECHO <em>or</em> UART RX ← sensor TX</td><td class="when">Trig/Echo or UART. Not used with RS485.</td></tr>
+        <tr><td><span class="pin">5</span></td><td>LoRa NSS <em>or</em> RS485 RO</td><td>LoRa NSS, <em>or</em> MAX485 RO</td><td class="when">Never both: an RS485 sensor means no Long Range module</td></tr>
+        <tr><td><span class="pin">17</span></td><td>RS485 DI</td><td>MAX485 DI</td><td class="when">RS485 sensor types only</td></tr>
+        <tr><td><span class="pin">18</span> <span class="pin">19</span> <span class="pin">23</span> <span class="pin">14</span> <span class="pin">26</span></td><td>LoRa SPI, RST, DIO0</td><td>LoRa module</td><td class="when">Long Range only. Leave unconnected for NearbyConnect / Home Network if no module is fitted.</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+
+  <div class="sheet">
+    <h3>Shared pins: what each one means per sensor type</h3>
+    <div class="tbl"><table>
+      <thead><tr><th>GPIO</th><th>Standard (Trig/Echo)</th><th>UART</th><th>RS485 bridge / Modbus</th><th>Long Range</th></tr></thead>
+      <tbody>
+        <tr><td><span class="pin">25</span></td><td>TRIG (out)</td><td>TX → sensor RX</td><td>DE + RE (out, HIGH = transmit)</td><td><span class="chip na">not used</span></td></tr>
+        <tr><td><span class="pin">34</span></td><td>ECHO (in)</td><td>RX ← sensor TX</td><td><span class="chip na">not used</span></td><td><span class="chip na">not used</span></td></tr>
+        <tr><td><span class="pin">5</span></td><td><span class="chip na">free / LoRa</span></td><td><span class="chip na">free / LoRa</span></td><td>RO (in)</td><td>NSS (out)</td></tr>
+        <tr><td><span class="pin">17</span></td><td><span class="chip na">not used</span></td><td><span class="chip na">not used</span></td><td>DI (out)</td><td><span class="chip na">not used</span></td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</section>
+
+<!-- 3. Setups -->
+<section aria-labelledby="setups-h">
+  <h2 id="setups-h">Wiring for each sensor type</h2>
+  <p class="muted">Select the matching type before connecting: Monitor → Settings → Sensor Connection → Wired → Wired sensor type. Transmitter → setup page → Sensor Type.</p>
+  <div class="setups">
+
+    <!-- A Trig/Echo -->
+    <article class="setup">
+      <div class="head"><h3>Standard (Trig/Echo)</h3><span class="tag">HC-SR04 · JSN-SR04T · cable up to ~50 m</span></div>
+      <div class="body">
+        <div class="diagram" role="img" aria-label="ESP32 GPIO25 to sensor TRIG; sensor ECHO through a 1k over 2k divider to GPIO34; 5V and GND to the sensor">
+          <svg viewBox="0 0 640 196">
+            <rect class="box" x="10" y="20" width="170" height="150" rx="6"/><text class="boxhead" x="24" y="44">ESP32</text>
+            <text x="24" y="78">5V (VIN)</text><text x="24" y="104">GPIO25</text><text x="24" y="130">GPIO34</text><text x="24" y="156">GND</text>
+            <rect class="box" x="460" y="20" width="170" height="150" rx="6"/><text class="boxhead" x="474" y="44">HC-SR04</text>
+            <text x="474" y="78">VCC</text><text x="474" y="104">TRIG</text><text x="474" y="130">ECHO</text><text x="474" y="156">GND</text>
+            <line x1="180" y1="74" x2="460" y2="74" stroke="var(--w-red)" stroke-width="3"/>
+            <line x1="180" y1="100" x2="460" y2="100" stroke="var(--w-yellow)" stroke-width="3"/>
+            <line x1="180" y1="126" x2="300" y2="126" stroke="var(--w-blue)" stroke-width="3"/>
+            <rect x="300" y="118" width="44" height="16" rx="2" fill="var(--paper)" stroke="var(--ink)"/><text class="lbl" x="309" y="130">1 kΩ</text>
+            <line x1="344" y1="126" x2="460" y2="126" stroke="var(--w-blue)" stroke-width="3"/>
+            <line x1="272" y1="126" x2="272" y2="140" stroke="var(--ink)" stroke-width="1.5"/>
+            <rect x="250" y="140" width="44" height="14" rx="2" fill="var(--paper)" stroke="var(--ink)"/><text class="lbl" x="259" y="151">2 kΩ</text>
+            <line x1="272" y1="154" x2="272" y2="152" stroke="var(--ink)"/>
+            <line x1="180" y1="152" x2="460" y2="152" stroke="var(--w-black)" stroke-width="3"/>
+            <text class="lbl" x="196" y="182">1 kΩ / 2 kΩ divider: GPIO34 sees 3.3 V</text>
+          </svg>
+        </div>
+        <div class="tbl"><table>
+          <thead><tr><th>Sensor pin</th><th>Goes to</th><th>Wire</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>VCC</td><td><span class="pin pwr">5V</span></td><td><span class="wire"><i style="background:var(--w-red)"></i>red</span></td><td>JSN-SR04T also works on 3.3 V</td></tr>
+            <tr><td>TRIG</td><td><span class="pin">GPIO25</span></td><td><span class="wire"><i style="background:var(--w-yellow)"></i>yellow</span></td><td>Direct. A 3.3 V trigger is enough.</td></tr>
+            <tr><td>ECHO</td><td><span class="pin">GPIO34</span></td><td><span class="wire"><i style="background:var(--w-blue)"></i>blue</span></td><td>Through a <b>1 kΩ</b> series / <b>2 kΩ</b> to GND divider when the sensor runs on 5 V. The 2 kΩ also stops an unplugged cable reading noise.</td></tr>
+            <tr><td>GND</td><td><span class="pin gnd">GND</span></td><td><span class="wire"><i style="background:var(--w-black)"></i>black</span></td><td></td></tr>
+          </tbody>
+        </table></div>
+        <div class="note"><b>Long cable:</b> use shielded or twisted cable, with GND twisted with ECHO. GPIO17 and GPIO5 stay unused. If a Long Range module is fitted, it may stay; it is simply not used in Wired mode.</div>
+      </div>
+    </article>
+
+    <!-- B UART -->
+    <article class="setup">
+      <div class="head"><h3>UART</h3><span class="tag">DYP-A01 (controlled) · DYP-A21 (auto-stream) · short cable</span></div>
+      <div class="body">
+        <div class="diagram" role="img" aria-label="ESP32 GPIO25 to sensor RX, sensor TX to GPIO34 with 10k pull-up to 3.3V, 3.3V and GND to sensor">
+          <svg viewBox="0 0 640 190">
+            <rect class="box" x="10" y="20" width="170" height="150" rx="6"/><text class="boxhead" x="24" y="44">ESP32</text>
+            <text x="24" y="78">3.3V</text><text x="24" y="104">GPIO25 (TX)</text><text x="24" y="130">GPIO34 (RX)</text><text x="24" y="156">GND</text>
+            <rect class="box" x="460" y="20" width="170" height="150" rx="6"/><text class="boxhead" x="474" y="44">DYP sensor</text>
+            <text x="474" y="78">VCC</text><text x="474" y="104">RX</text><text x="474" y="130">TX</text><text x="474" y="156">GND</text>
+            <line x1="180" y1="74" x2="460" y2="74" stroke="var(--w-red)" stroke-width="3"/>
+            <line x1="180" y1="100" x2="460" y2="100" stroke="var(--w-yellow)" stroke-width="3"/>
+            <line x1="180" y1="126" x2="460" y2="126" stroke="var(--w-white)" stroke-width="3"/>
+            <line x1="180" y1="126" x2="460" y2="126" stroke="var(--w-grey)" stroke-width="1" stroke-dasharray="3 3"/>
+            <line x1="180" y1="152" x2="460" y2="152" stroke="var(--w-black)" stroke-width="3"/>
+            <line x1="300" y1="74" x2="300" y2="92" stroke="var(--ink)" stroke-width="1.5"/>
+            <line x1="300" y1="108" x2="300" y2="126" stroke="var(--ink)" stroke-width="1.5"/>
+            <text class="lbl" x="310" y="92">10 kΩ pull-up</text>
+            <text class="lbl" x="196" y="118">TX crosses to RX</text>
+          </svg>
+        </div>
+        <div class="tbl"><table>
+          <thead><tr><th>Sensor pin</th><th>Goes to</th><th>Wire</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>VCC</td><td><span class="pin pwr">3.3V</span></td><td><span class="wire"><i style="background:var(--w-red)"></i>red</span></td><td>Power at 3.3 V so the sensor's TX is 3.3 V. On 5 V, put a 1 kΩ / 2 kΩ divider on the TX line.</td></tr>
+            <tr><td>RX (trigger)</td><td><span class="pin">GPIO25</span></td><td><span class="wire"><i style="background:var(--w-yellow)"></i>yellow</span></td><td>ESP32 TX. Controlled sensors measure when they receive a byte.</td></tr>
+            <tr><td>TX (data out)</td><td><span class="pin">GPIO34</span></td><td><span class="wire"><i style="background:var(--w-white)"></i>white</span></td><td>ESP32 RX. Add a <b>10 kΩ pull-up to 3.3 V</b> so an unplugged sensor reads as silent, not noise. Use a pull-up here, not the pull-down used for Trig/Echo.</td></tr>
+            <tr><td>GND</td><td><span class="pin gnd">GND</span></td><td><span class="wire"><i style="background:var(--w-black)"></i>black</span></td><td></td></tr>
+          </tbody>
+        </table></div>
+        <div class="note"><b>Cable:</b> keep it short (a few metres). For long runs use RS485 (UART bridge) instead. Mode and baud (auto-stream 115200 / 9600, controlled 9600) are detected on first start and remembered. Override in Settings if detection fails.</div>
+      </div>
+    </article>
+
+    <!-- C RS485 bridge -->
+    <article class="setup">
+      <div class="head"><h3>RS485 (UART bridge)</h3><span class="tag">DYP-A06 + TTL-RS485 bridge · long cable · 9600 baud, trigger 0x55</span></div>
+      <div class="body">
+        <div class="diagram" role="img" aria-label="ESP32 to MAX485 module: GPIO5 to RO, GPIO17 to DI, GPIO25 to DE and RE; A and B twisted pair to an auto-direction TTL-RS485 module at the sensor; that module's TXD and RXD to the DYP sensor">
+          <svg viewBox="0 0 900 200">
+            <rect class="box" x="10" y="20" width="150" height="160" rx="6"/><text class="boxhead" x="22" y="44">ESP32</text>
+            <text x="22" y="76">GPIO5 (RX)</text><text x="22" y="102">GPIO17 (TX)</text><text x="22" y="128">GPIO25 (DIR)</text><text x="22" y="160">GND</text>
+            <rect class="box" x="240" y="20" width="150" height="160" rx="6"/><text class="boxhead" x="252" y="44">MAX485</text>
+            <text x="252" y="76">RO</text><text x="252" y="102">DI</text><text x="252" y="128">DE + RE</text><text x="252" y="160">GND</text>
+            <text x="336" y="90">A</text><text x="336" y="140">B</text>
+            <line x1="160" y1="72" x2="240" y2="72" stroke="var(--w-green)" stroke-width="3"/>
+            <line x1="160" y1="98" x2="240" y2="98" stroke="var(--w-orange)" stroke-width="3"/>
+            <line x1="160" y1="124" x2="240" y2="124" stroke="var(--w-purple)" stroke-width="3"/>
+            <line x1="160" y1="156" x2="240" y2="156" stroke="var(--w-black)" stroke-width="3"/>
+            <path d="M390 86 C 450 86, 470 136, 530 136 S 610 86, 640 86" fill="none" stroke="var(--w-blue)" stroke-width="3"/>
+            <path d="M390 136 C 450 136, 470 86, 530 86 S 610 136, 640 136" fill="none" stroke="var(--w-white)" stroke-width="3"/>
+            <path d="M390 136 C 450 136, 470 86, 530 86 S 610 136, 640 136" fill="none" stroke="var(--w-grey)" stroke-width="1" stroke-dasharray="3 3"/>
+            <text class="lbl" x="440" y="70">twisted pair, A to A, B to B</text>
+            <text class="lbl" x="452" y="178">120 Ω across A-B at each end</text>
+            <rect class="box" x="640" y="20" width="120" height="160" rx="6"/><text class="boxhead" x="650" y="44">TTL-RS485</text>
+            <text class="lbl" x="650" y="60">auto direction</text>
+            <text x="650" y="90">A</text><text x="650" y="140">B</text><text x="700" y="90">TXD</text><text x="700" y="140">RXD</text>
+            <rect class="box" x="790" y="40" width="100" height="120" rx="6"/><text class="boxhead" x="800" y="64">DYP-A06</text>
+            <text x="800" y="94">TX</text><text x="800" y="134">RX</text>
+            <line x1="760" y1="86" x2="790" y2="90" stroke="var(--w-white)" stroke-width="3"/>
+            <line x1="760" y1="136" x2="790" y2="130" stroke="var(--w-yellow)" stroke-width="3"/>
+          </svg>
+        </div>
+        <div class="two">
+          <div class="tbl"><table style="min-width:0">
+            <thead><tr><th>ESP32 side (MAX485)</th><th>Goes to</th></tr></thead>
+            <tbody>
+              <tr><td>RO</td><td><span class="pin">GPIO5</span></td></tr>
+              <tr><td>DI</td><td><span class="pin">GPIO17</span></td></tr>
+              <tr><td>DE + RE (tied together)</td><td><span class="pin">GPIO25</span></td></tr>
+              <tr><td>VCC / GND</td><td><span class="pin pwr">3.3V</span> for MAX3485, <span class="pin pwr">5V</span> for MAX485 · <span class="pin gnd">GND</span></td></tr>
+              <tr><td>A / B</td><td>Cable to the sensor-end module A / B</td></tr>
+            </tbody>
+          </table></div>
+          <div class="tbl"><table style="min-width:0">
+            <thead><tr><th>Sensor side (auto-direction module)</th><th>Goes to</th></tr></thead>
+            <tbody>
+              <tr><td>TXD / RXD</td><td>DYP-A06 TX / RX (check the module's labels: data out of the sensor goes into the module's input)</td></tr>
+              <tr><td>VCC / GND</td><td>Sensor supply</td></tr>
+              <tr><td>A / B</td><td>Cable A / B from the display end</td></tr>
+            </tbody>
+          </table></div>
+        </div>
+        <div class="note bad"><b>5 V MAX485 modules:</b> RO swings to 5 V. Use a MAX3485 or similar 3.3 V module, or put a 1 kΩ / 2 kΩ divider between RO and GPIO5.</div>
+        <div class="note"><b>Long runs:</b> twisted pair (CAT5 works), 120 Ω terminating resistor across A-B at both ends, and a module with fail-safe bias. An open, unbiased bus floats and can look like a "sensor answered" signal. Range depends on cable and noise. 9600 baud over a few hundred metres is typical. <b>No Long Range module on this board.</b></div>
+      </div>
+    </article>
+
+    <!-- D Modbus -->
+    <article class="setup">
+      <div class="head"><h3>RS485 Modbus</h3><span class="tag">Native Modbus-RTU sensor · function 0x03 · register 0x0101 · 9600 8N1</span></div>
+      <div class="body">
+        <div class="tbl"><table>
+          <thead><tr><th>Connection</th><th>Goes to</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>MAX485 RO / DI / DE+RE</td><td><span class="pin">GPIO5</span> / <span class="pin">GPIO17</span> / <span class="pin">GPIO25</span></td><td>Same ESP32-side wiring as the UART bridge</td></tr>
+            <tr><td>Sensor A / B</td><td>MAX485 A / B</td><td>Directly. No bridge module at the sensor end.</td></tr>
+            <tr><td>Sensor power</td><td>Per the sensor's label (often 5 to 24 V DC)</td><td>Share GND with the ESP32 side when the supplies are separate</td></tr>
+            <tr><td>Sensor address</td><td>Settings → Modbus sensor address</td><td>Default 1 (range 1 to 247). Must match the sensor.</td></tr>
+          </tbody>
+        </table></div>
+        <div class="note">Reads the <b>real-time</b> distance register 0x0101 (not the processed 0x0100). Same 3.3 V, termination and bias rules as the UART bridge. <b>No Long Range module on this board.</b></div>
+      </div>
+    </article>
+
+    <!-- E LoRa -->
+    <article class="setup">
+      <div class="head"><h3>Long Range module</h3><span class="tag">SX1278 / Ra-02, 433 MHz · Monitor and Transmitter</span></div>
+      <div class="body">
+        <div class="tbl"><table>
+          <thead><tr><th>LoRa pin</th><th>Goes to</th><th>LoRa pin</th><th>Goes to</th></tr></thead>
+          <tbody>
+            <tr><td>VCC</td><td><span class="pin pwr">3.3V</span> (never 5 V)</td><td>NSS</td><td><span class="pin">GPIO5</span></td></tr>
+            <tr><td>GND</td><td><span class="pin gnd">GND</span></td><td>RST</td><td><span class="pin">GPIO14</span></td></tr>
+            <tr><td>SCK</td><td><span class="pin">GPIO18</span></td><td>DIO0</td><td><span class="pin">GPIO26</span></td></tr>
+            <tr><td>MISO</td><td><span class="pin">GPIO19</span></td><td>ANT</td><td>433 MHz antenna, fitted before power-on</td></tr>
+            <tr><td>MOSI</td><td><span class="pin">GPIO23</span></td><td></td><td></td></tr>
+          </tbody>
+        </table></div>
+        <div class="note">Used for the <b>Long Range</b> connection type, and by <b>Auto</b> when the module is detected at start-up. Works alongside a Trig/Echo or UART sensor on the transmitter. <b>Not with RS485.</b></div>
+      </div>
+    </article>
+
+  </div>
+</section>
+
+<!-- 4. Compatibility -->
+<section aria-labelledby="matrix-h">
+  <h2 id="matrix-h">What can be fitted together</h2>
+  <div class="sheet">
+    <div class="tbl"><table class="matrix">
+      <thead><tr><th>Setup</th><th>Long Range module</th><th>Trig/Echo sensor</th><th>UART sensor</th><th>RS485 module</th><th>OLED, buzzer, button</th></tr></thead>
+      <tbody>
+        <tr><td><b>Monitor</b>, Wired: Trig/Echo</td><td><span class="chip warn">Allowed, unused</span></td><td><span class="chip ok">Required</span></td><td><span class="chip no">Never</span></td><td><span class="chip no">Never</span></td><td><span class="chip ok">Yes</span></td></tr>
+        <tr><td><b>Monitor</b>, Wired: UART</td><td><span class="chip warn">Allowed, unused</span></td><td><span class="chip no">Never</span></td><td><span class="chip ok">Required</span></td><td><span class="chip no">Never</span></td><td><span class="chip ok">Yes</span></td></tr>
+        <tr><td><b>Monitor</b>, Wired: RS485 bridge / Modbus</td><td><span class="chip no">Never (GPIO5)</span></td><td><span class="chip no">Never</span></td><td><span class="chip no">Never</span></td><td><span class="chip ok">Required</span></td><td><span class="chip ok">Yes</span></td></tr>
+        <tr><td><b>Monitor</b>, Long Range / Auto</td><td><span class="chip ok">Required</span></td><td><span class="chip na">Leave off</span></td><td><span class="chip na">Leave off</span></td><td><span class="chip no">Never</span></td><td><span class="chip ok">Yes</span></td></tr>
+        <tr><td><b>Monitor</b>, NearbyConnect / Home Network</td><td><span class="chip warn">Optional</span></td><td><span class="chip na">Leave off</span></td><td><span class="chip na">Leave off</span></td><td><span class="chip na">Leave off</span></td><td><span class="chip ok">Yes</span></td></tr>
+        <tr><td><b>Transmitter</b>, Trig/Echo or UART sensor</td><td><span class="chip warn">For Long Range only</span></td><td colspan="2"><span class="chip ok">Exactly one of the two</span></td><td><span class="chip no">Never</span></td><td><span class="chip na">Not on transmitter</span></td></tr>
+        <tr><td><b>Transmitter</b>, RS485 sensor</td><td><span class="chip no">Never (GPIO5)</span></td><td><span class="chip no">Never</span></td><td><span class="chip no">Never</span></td><td><span class="chip ok">Required</span></td><td><span class="chip na">Not on transmitter</span></td></tr>
+      </tbody>
+    </table></div>
+    <p class="muted">An RS485 transmitter talks to the display over NearbyConnect or Home Network only. The setup page refuses RS485 together with Long Range.</p>
+  </div>
+</section>
+
+<!-- 5. Bring-up -->
+<section aria-labelledby="check-h">
+  <h2 id="check-h">First power-on check</h2>
+  <div class="sheet">
+    <ol class="steps">
+      <li><span>Before power: check no GPIO can see more than 3.3 V, only one sensor type is connected, and RS485 boards have no LoRa module.</span></li>
+      <li><span>Power on, open the setup page, and select the sensor type that is actually wired. The board restarts.</span></li>
+      <li><span>Open the serial monitor at 115200 baud and type <code>SENSOR</code> to see the type, range and settings.</span></li>
+      <li><span><code>SENSOR TEST</code> takes one reading. "No reply" points at wiring or power. "Answered but no valid distance" means the target is out of range or in the blind zone.</span></li>
+      <li><span><code>SENSOR RAW</code> prints the bytes on the line. Nothing at all usually means TX/RX are swapped, A/B are swapped, or DE/RE are not tied to GPIO25.</span></li>
+      <li><span>On the display: a pulsing heart means the sensor is alive. <b>CHECK SENSOR</b> means it gave no answer for 3 readings in a row.</span></li>
+    </ol>
+  </div>
+</section>
+
+<section aria-labelledby="range-h">
+  <h2 id="range-h">Sensor ranges used by the firmware</h2>
+  <div class="sheet"><div class="tbl"><table>
+    <thead><tr><th>Sensor type</th><th>Blind zone</th><th>Max range</th><th>Readings per cycle</th></tr></thead>
+    <tbody>
+      <tr><td>Standard (Trig/Echo)</td><td class="mono">21 cm</td><td class="mono">450 cm</td><td>15, MAD filtered</td></tr>
+      <tr><td>UART (DYP-A01 / A21)</td><td class="mono">28 cm</td><td class="mono">750 cm</td><td>7, MAD filtered</td></tr>
+      <tr><td>RS485 (UART bridge, DYP-A06)</td><td class="mono">30 cm</td><td class="mono">200 cm</td><td>7, MAD filtered</td></tr>
+      <tr><td>RS485 Modbus</td><td class="mono">28 cm</td><td class="mono">750 cm</td><td>7, MAD filtered</td></tr>
+    </tbody>
+  </table></div>
+  <p class="muted">Tank height in Settings must not be more than the sensor's max range. When the water is inside the blind zone, the display shows Full (estimated).</p></div>
+</section>
+
+<footer>Pin numbers match MONITOR2026_v56.ino and TRANSMITTER2026_v55.ino on branch claude/adoring-clarke-n9k1ti. Resistor values are standard practice for 3.3 V level shifting; confirm voltages on your own sensor modules before power-on.</footer>
+</div>
+</body>
+</html>
